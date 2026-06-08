@@ -1,0 +1,72 @@
+# CA-CRS-Research — Central Configuration
+# All dataset paths, parameter bounds, and calibration defaults live here.
+
+# ── Dataset Paths ──────────────────────────────────────────────────────────────
+datasets:
+  shanghaitech: "/Users/riyansh/Downloads/archive/ShanghaiTech"
+  ucf_qnrf:     "/Users/riyansh/Downloads/UCF-QNRF_ECCV18"
+  pets2009:     "/Users/riyansh/Downloads/Trajectory-Prediction-Pedestrian-31e2b8cd75ab0e68e9b6cf2470bb885eb82640d2-datasets-PETS-2009-data/datasets/PETS-2009/data"
+
+# ── Output Directories ─────────────────────────────────────────────────────────
+outputs:
+  tables:       "outputs/tables"
+  calibration:  "outputs/calibration"
+  sensitivity:  "outputs/sensitivity"
+
+# ── Occlusion Correction Factor κ(ρ) ─────────────────────────────────────────
+# Empirically calibrated via SAHI + YOLOv8n head-detection model on
+# ShanghaiTech A+B (SAHI slicing 512x512) + UCF-QNRF (standard imgsz=1280).
+# Formula: κ(ρ) = 1 + α₀ · ρ^γ   where ρ = gt_count / max_gt_count
+# Calibration date: 2026-06-08  |  n=1,601 images  |  R²=0.615
+#
+# NOTE: β (pairwise box IoU) has been confirmed as a useless predictor
+#       (R²=-0.04) — only density-based ρ produces meaningful fits.
+kappa:
+  mode:        "density"           # "density" (ρ-based) or "beta" (β-based)
+  alpha0:      8.2442              # empirical α₀ (SAHI head-detection)
+  gamma:       1.1333              # empirical γ  (SAHI head-detection)
+  r2:          0.6152              # goodness of fit
+  # Init/bounds kept for re-fitting experiments
+  alpha0_init:   8.0
+  gamma_init:    1.1
+  alpha0_bounds: [0.5, 15.0]
+  gamma_bounds:  [0.5,  3.0]
+  # Previous baseline for reference (YOLO person-detector, COCO weights)
+  _prev_alpha0:  10.0
+  _prev_gamma:   0.674
+  _prev_r2:      0.672
+
+# ── CA-CRS+ Risk Score Parameters ─────────────────────────────────────────────
+# Formula: CRS = w1*D + Φ(D,S) + w3*C
+#          Φ(D,S) = w2*S*(1-D) + γ_exp * exp(λ*(D-S))
+# Calibrated on PETS2009 trajectories via Sobol sensitivity analysis.
+# Sobol result: w1/w2/w3 are insensitive → fixed. γ_exp and λ are critical.
+risk_scoring:
+  w1_default:        0.40    # density weight          (Sobol: insensitive)
+  w2_default:        0.30    # speed/gridlock weight   (Sobol: insensitive)
+  w3_default:        0.30    # conflict weight         (Sobol: insensitive)
+  gamma_exp_default: 0.01    # exponential crush penalty amplitude (tuned)
+  lambda_default:    8.492   # exponential crush penalty sharpness (tuned)
+  # PETS2009 validation metrics with above params
+  _pets_accuracy:    0.75
+  _pets_separation:  0.3105
+
+# ── Sobol Sensitivity Analysis: parameter bounds ───────────────────────────────
+# Five tunable risk parameters only — as per CA-CRS+ framework specification.
+sensitivity:
+  n_samples: 1024          # Saltelli N (total = N*(2D+2) samples)
+  problem:
+    names:  ["w1", "w2", "w3", "gamma_exp", "lambda"]
+    bounds:
+      w1:        [0.20, 0.60]    # density weight
+      w2:        [0.10, 0.50]    # speed/gridlock weight
+      w3:        [0.10, 0.50]    # conflict weight
+      gamma_exp: [0.01, 0.20]   # exponential crush penalty amplitude
+      lambda:    [1.0,  8.0]    # exponential crush penalty sharpness
+  # Threshold below which a parameter is recommended to be fixed
+  fix_threshold_ST: 0.05
+
+# ── Density / Physics Constants (read-only, from original codebase) ────────────
+physics:
+  rho_max: 7.0      # persons/m² — saturation density for D_norm
+  v_max:   15.0     # pixels/frame — saturation speed for S_norm

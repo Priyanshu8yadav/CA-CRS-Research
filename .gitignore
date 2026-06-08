@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Large model weights — download separately via HuggingFace
+models/*.pt
+models/*.onnx
+models/*.engine
+
+# Large output / calibration data (too big for GitHub)
+outputs/calibration/yolo_calibration_dataset.csv
+outputs/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Streamlit cache
+.streamlit/
+
+# Logs
+*.log
