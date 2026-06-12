@@ -1,13 +1,19 @@
 """
-app.py — CA-CRS+ Crowd Safety Command Dashboard
-================================================
+app.py — CA-CRS⁺ Crowd Safety Command Dashboard (Production)
+==============================================================
 Run with:  streamlit run dashboard/app.py
+
+Production features:
+  - Flicker-free rendering via st.empty() placeholders
+  - Threaded video stream (non-blocking, RTSP-ready)
+  - Non-blocking Modbus gate writes
+  - Emergency lockdown button
+  - RTSP URL support in sidebar
 """
 from __future__ import annotations
 
 import sys
 import time
-import math
 import json
 import logging
 from pathlib import Path
@@ -30,14 +36,15 @@ from dashboard.ca_crs_engine import (
     KAPPA_ALPHA0, KAPPA_GAMMA,
 )
 from dashboard.virtual_plc import (
-    start_plc_server, write_gate, read_all_gates, is_plc_running,
+    start_plc_server, write_gate, write_emergency_open,
+    read_all_gates, is_plc_running,
 )
 
 logging.basicConfig(level=logging.WARNING)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="CA-CRS+ | Crowd Safety Command",
+    page_title="CA-CRS⁺ | Crowd Safety Command",
     page_icon="🚨",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -162,6 +169,17 @@ div[data-testid="stImage"] img { border-radius: 10px; }
 
 /* Remove default padding */
 .block-container { padding-top: 1rem; padding-bottom: 0; }
+
+/* Emergency button styling */
+.emergency-btn {
+    background: linear-gradient(135deg, #dc2626, #991b1b) !important;
+    border: 2px solid #ef4444 !important;
+    animation: emergency-pulse 1s infinite;
+}
+@keyframes emergency-pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(239,68,68,0.4); }
+    50% { box-shadow: 0 0 24px rgba(239,68,68,0.8); }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -180,6 +198,8 @@ def init_session():
         st.session_state.tick = 0
     if "auto_gate" not in st.session_state:
         st.session_state.auto_gate = True
+    if "emergency_active" not in st.session_state:
+        st.session_state.emergency_active = False
 
 
 init_session()
@@ -187,18 +207,20 @@ init_session()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🚨 CA-CRS+ Command")
+    st.markdown("## 🚨 CA-CRS⁺ Command")
     st.markdown("**Crowd Risk Scoring System**")
     st.markdown("---")
 
     st.markdown('<div class="section-header">Zone Configuration</div>',
                 unsafe_allow_html=True)
 
-    VIDEO_A = st.text_input("Zone A — Video Path",
+    st.caption("💡 Supports local files & RTSP URLs (e.g. `rtsp://user:pass@192.168.1.100:554/stream1`)")
+
+    VIDEO_A = st.text_input("Zone A — Video Source",
                              value="/Users/riyansh/Downloads/scen_a.mp4")
-    VIDEO_B = st.text_input("Zone B — Video Path",
+    VIDEO_B = st.text_input("Zone B — Video Source",
                              value="/Users/riyansh/Downloads/scen_b.mp4")
-    VIDEO_C = st.text_input("Zone C — Video Path",
+    VIDEO_C = st.text_input("Zone C — Video Source",
                              value="/Users/riyansh/Downloads/scen_c.mp4")
 
     ZONE_LABELS = {
@@ -242,7 +264,17 @@ def load_model(model_path: str):
 MODEL_PATH = str(ROOT / "models" / "yolov8n_crowd_head.pt")
 
 
-# ── Helper: Plotly gauge ──────────────────────────────────────────────────────
+# ── Helpers: source validation ─────────────────────────────────────────────────
+_RTSP_PREFIXES = ("rtsp://", "rtsp_tcp://", "rtsps://", "http://", "https://")
+
+def is_valid_source(source: str) -> bool:
+    """Check if a video source is a valid file path or RTSP URL."""
+    if any(source.lower().startswith(p) for p in _RTSP_PREFIXES):
+        return True
+    return Path(source).exists()
+
+
+# ── Helpers: Plotly charts ──────────────────────────────────────────────────────
 def make_gauge(value: float, title: str, color: str) -> go.Figure:
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
@@ -275,7 +307,6 @@ def make_gauge(value: float, title: str, color: str) -> go.Figure:
     return fig
 
 
-# ── Helper: Risk timeline ─────────────────────────────────────────────────────
 def make_risk_chart(states: list[ZoneState]) -> go.Figure:
     fig = go.Figure()
     FILL_COLORS = {
@@ -300,7 +331,6 @@ def make_risk_chart(states: list[ZoneState]) -> go.Figure:
             fillcolor=FILL_COLORS.get(s.zone_id, "rgba(99,102,241,0.08)"),
         ))
 
-    # Threshold lines
     fig.add_hline(y=THRESHOLD_WARN,   line=dict(color="#f59e0b", dash="dash", width=1.5),
                   annotation_text="WARNING 0.35", annotation_position="top left",
                   annotation_font=dict(color="#f59e0b", size=10))
@@ -321,7 +351,6 @@ def make_risk_chart(states: list[ZoneState]) -> go.Figure:
     return fig
 
 
-# ── Helper: Causal breakdown stacked bar ─────────────────────────────────────
 def make_causal_chart(states: list[ZoneState]) -> go.Figure:
     labels = [s.label for s in states]
     density  = [s.density  for s in states]
@@ -353,83 +382,59 @@ def make_causal_chart(states: list[ZoneState]) -> go.Figure:
     return fig
 
 
-# ── Helper: Gate status HTML ──────────────────────────────────────────────────
-def gate_html(label: str, cmd: str, is_open: bool, color: str,
-              ripple_note: str = "") -> str:
-    dot_color = "#22c55e" if is_open else "#ef4444"
-    cmd_colors = {
-        "OPEN":     ("#22c55e", "rgba(34,197,94,0.09)",  "rgba(34,197,94,0.27)"),
-        "CLOSE":    ("#ef4444", "rgba(239,68,68,0.09)",  "rgba(239,68,68,0.27)"),
-        "REDIRECT": ("#f59e0b", "rgba(245,158,11,0.09)", "rgba(245,158,11,0.27)"),
-        "HOLD":     ("#64748b", "rgba(100,116,139,0.09)","rgba(100,116,139,0.27)"),
-    }
-    cc, cbg, cborder = cmd_colors.get(cmd, cmd_colors["HOLD"])
-    ripple = (f"<br><span style='font-size:10px;color:#64748b'>{ripple_note}</span>"
-              if ripple_note else "")
-    return f"""<div style="display:flex;align-items:center;gap:12px;
-        background:#0f1628;border-radius:10px;padding:12px 16px;
-        margin:6px 0;border:1px solid #1e2d4a">
-        <div style="width:14px;height:14px;border-radius:50%;
-                    background:{dot_color};box-shadow:0 0 8px {dot_color};
-                    flex-shrink:0"></div>
-        <div style="flex:1">
-            <div style="font-weight:600;font-size:13px;color:#e2e8f0">{label}</div>
-            {ripple}
-        </div>
-        <div style="font-family:'JetBrains Mono',monospace;font-weight:700;
-                    font-size:13px;color:{cc};background:{cbg};
-                    padding:4px 10px;border-radius:6px;border:1px solid {cborder}">
-            {cmd}
-        </div>
-    </div>"""
-
-
-
-# ── Helper: Telemetry row ─────────────────────────────────────────────────────
-def telem_html(label: str, value: str, color: str = "#94a3b8") -> str:
+# ── Render: zone info card (below video) ──────────────────────────────────────
+def zone_info_html(s: ZoneState) -> str:
+    border = s.color
     return f"""
-    <div class="telemetry-row">
-        <span style="color:#64748b">{label}</span>
-        <span style="color:{color};font-weight:600">{value}</span>
-    </div>"""
+    <div style='display:flex;justify-content:space-between;
+                align-items:center;padding:6px 2px'>
+        <span style='font-weight:700;font-size:14px;color:#e2e8f0'>
+            {s.label}
+        </span>
+        <span style='background:{border}22;color:{border};
+                     padding:2px 10px;border-radius:12px;
+                     font-size:11px;font-weight:700;
+                     border:1px solid {border}55'>
+            {s.status}
+        </span>
+    </div>
+    <div style='display:flex;gap:8px;margin:4px 0'>
+        <div style='flex:1;background:#0f1628;border-radius:8px;
+                    padding:8px 10px;border:1px solid #1e2d4a'>
+            <div style='font-size:10px;color:#64748b'>CRS Score</div>
+            <div style='font-size:20px;font-weight:800;
+                        font-family:JetBrains Mono;color:{border}'>
+                {s.risk:.3f}
+            </div>
+        </div>
+        <div style='flex:1;background:#0f1628;border-radius:8px;
+                    padding:8px 10px;border:1px solid #1e2d4a'>
+            <div style='font-size:10px;color:#64748b'>Heads (raw→corr)</div>
+            <div style='font-size:14px;font-weight:700;
+                        font-family:JetBrains Mono;color:#e2e8f0'>
+                {s.head_count} → {s.corrected_count}
+            </div>
+        </div>
+        <div style='flex:1;background:#0f1628;border-radius:8px;
+                    padding:8px 10px;border:1px solid #1e2d4a'>
+            <div style='font-size:10px;color:#64748b'>κ (ρ-corr)</div>
+            <div style='font-size:20px;font-weight:800;
+                        font-family:JetBrains Mono;color:#94a3b8'>
+                {s.kappa:.2f}
+            </div>
+        </div>
+    </div>
+    """
 
 
-# ── Main render loop ──────────────────────────────────────────────────────────
-def render_dashboard(processors: list[ZoneProcessor]):
-    # Process one frame per zone
-    states: list[ZoneState] = [p.process_frame() for p in processors]
-    grs = compute_grs(states)
-    grs_status, grs_color = classify(grs)
-    total_heads = sum(s.head_count for s in states)
-    n_marshals, marshal_status = marshal_demand(total_heads)
-    st.session_state.tick += 1
+# ── Main dashboard loop (flicker-free with st.empty) ─────────────────────────
+def run_dashboard(processors: list[ZoneProcessor]):
+    """
+    Main rendering loop using st.empty() placeholders.
+    Static layout is created ONCE. Only dynamic data updates in-place.
+    """
 
-    # ── Auto gate control + ripple logic ────────────────────────────────────
-    gate_cmds = [s.gate_cmd for s in states]
-    gate_cmds_final = list(gate_cmds)
-    ripple_notes = ["", "", ""]
-
-    if st.session_state.auto_gate:
-        for i, s in enumerate(states):
-            should_open = s.status == "DANGER"
-            # Ripple: if REDIRECT but downstream zone is also DANGER → downgrade to HOLD
-            if s.status == "WARNING":
-                downstream_idx = (i + 1) % len(states)
-                if states[downstream_idx].status == "DANGER":
-                    gate_cmds_final[i] = "HOLD"
-                    ripple_notes[i] = "⚠ Ripple: downstream congested → HOLD"
-            new_open = (gate_cmds_final[i] == "OPEN")
-            if new_open != st.session_state.gate_states.get(i, False):
-                ok = write_gate(i, new_open)
-                if ok:
-                    action = "OPENED" if new_open else "CLOSED"
-                    log_entry = f"[{time.strftime('%H:%M:%S')}] {s.label} gate {action}"
-                    st.session_state.gate_log = ([log_entry] +
-                                                  st.session_state.gate_log)[:20]
-                st.session_state.gate_states[i] = new_open
-
-    # ── Layout ─────────────────────────────────────────────────────────────
-    # Title bar
+    # ── Static header ────────────────────────────────────────────────────────
     col_title, col_tick = st.columns([8, 2])
     with col_title:
         st.markdown(f"""
@@ -439,91 +444,178 @@ def render_dashboard(processors: list[ZoneProcessor]):
         <p style='margin:2px 0 0 0;font-size:13px;color:#475569;'>
             Real-time multi-zone crowd risk scoring &amp; gate control
         </p>""", unsafe_allow_html=True)
-    with col_tick:
-        st.markdown(f"""
+    ph_tick = col_tick.empty()
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── Video feed row: create placeholders ──────────────────────────────────
+    vid_cols = st.columns(3)
+    ph_videos = []
+    ph_zone_info = []
+    for col in vid_cols:
+        with col:
+            ph_videos.append(col.empty())
+            ph_zone_info.append(col.empty())
+
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+    # ── Middle row: GRS + Charts + Gates ─────────────────────────────────────
+    left, mid, right = st.columns([2, 4, 2])
+
+    with left:
+        st.markdown('<div class="section-header">Global Risk Score</div>',
+                    unsafe_allow_html=True)
+        ph_gauge = left.empty()
+
+        st.markdown('<div class="section-header">Zone Triage (↑ Risk)</div>',
+                    unsafe_allow_html=True)
+        ph_triage = left.empty()
+
+        st.markdown('<div class="section-header">Resource Demand</div>',
+                    unsafe_allow_html=True)
+        ph_marshal = left.empty()
+
+    with mid:
+        st.markdown('<div class="section-header">CA-CRS⁺ Risk Score — Live Timeline</div>',
+                    unsafe_allow_html=True)
+        ph_timeline = mid.empty()
+
+        st.markdown('<div class="section-header">Causal Factor Breakdown</div>',
+                    unsafe_allow_html=True)
+        ph_causal = mid.empty()
+
+        # Static calibration expander
+        with st.expander("📊 Calibration & Sensitivity Results", expanded=False):
+            m1, m2, m3 = st.columns(3)
+            m1.metric("κ(ρ) R²", "0.615", "▲ vs YOLO-person")
+            m2.metric("Head Det. Rate", "83.8%", "ShanghaiTech A")
+            m3.metric("PETS2009 Acc.", "75%", "DANGER classification")
+            try:
+                kappa_params = json.loads(
+                    (ROOT / "outputs/calibration/kappa_params_density.json").read_text()
+                )
+                st.markdown(f"""
+                **κ(ρ) = 1 + {kappa_params['alpha0']} · ρ^{kappa_params['gamma']}**
+                — calibrated on {kappa_params['n_samples_total']:,} images (ShanghaiTech A/B + UCF-QNRF).
+                β-based fitting R² = {kappa_params['metrics']['beta_r2']:.3f} (useless);
+                ρ-based R² = {kappa_params['metrics']['r2']:.3f} ✓
+                """)
+            except Exception:
+                st.caption("Calibration params file not found.")
+
+    with right:
+        plc_online = is_plc_running()
+        plc_status_txt = "🟢 PLC ONLINE" if plc_online else "🟡 PLC CONNECTING"
+        st.markdown(f'<div class="section-header">Gate Control &nbsp; <span style="float:right;font-size:10px;color:{"#22c55e" if plc_online else "#f59e0b"}">{plc_status_txt}</span></div>',
+                    unsafe_allow_html=True)
+        ph_gates = right.empty()
+
+        # Manual override section
+        st.markdown('<div class="section-header">Manual Override</div>',
+                    unsafe_allow_html=True)
+        for i, lbl in enumerate(["A", "B", "C"]):
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(f"🔓 Z{lbl}", key=f"open_{i}", use_container_width=True):
+                    write_gate(i, True)
+                    st.session_state.gate_states[i] = True
+            with c2:
+                if st.button(f"🔒 Z{lbl}", key=f"close_{i}", use_container_width=True):
+                    write_gate(i, False)
+                    st.session_state.gate_states[i] = False
+
+        # Emergency lockdown
+        st.markdown('<div class="section-header">Emergency</div>',
+                    unsafe_allow_html=True)
+        if st.button("🚨 EMERGENCY — OPEN ALL GATES", key="emergency",
+                     use_container_width=True, type="primary"):
+            write_emergency_open()
+            for i in range(3):
+                st.session_state.gate_states[i] = True
+            st.session_state.emergency_active = True
+            st.session_state.gate_log = (
+                [f"[{time.strftime('%H:%M:%S')}] 🚨 EMERGENCY LOCKDOWN — ALL GATES OPENED"]
+                + st.session_state.gate_log
+            )[:20]
+
+        # Gate event log
+        st.markdown('<div class="section-header">Gate Event Log</div>',
+                    unsafe_allow_html=True)
+        ph_gate_log = right.empty()
+
+    # ── Bottom: telemetry ────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Edge Hardware Telemetry</div>',
+                unsafe_allow_html=True)
+    telem_cols = st.columns(6)
+    ph_telemetry = [col.empty() for col in telem_cols]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  LIVE UPDATE LOOP — only placeholders are updated, no DOM rebuild
+    # ═══════════════════════════════════════════════════════════════════════════
+    while st.session_state.processors is not None:
+        # Process one frame per zone
+        states: list[ZoneState] = [p.process_frame() for p in processors]
+        grs = compute_grs(states)
+        grs_status, grs_color = classify(grs)
+        total_heads = sum(s.head_count for s in states)
+        n_marshals, marshal_status = marshal_demand(total_heads)
+        st.session_state.tick += 1
+
+        # ── Auto gate control + ripple logic ─────────────────────────────────
+        gate_cmds = [s.gate_cmd for s in states]
+        gate_cmds_final = list(gate_cmds)
+        ripple_notes = ["", "", ""]
+
+        if st.session_state.auto_gate:
+            for i, s in enumerate(states):
+                # Ripple: if REDIRECT but downstream zone is DANGER → HOLD
+                if s.status == "WARNING":
+                    downstream_idx = (i + 1) % len(states)
+                    if states[downstream_idx].status == "DANGER":
+                        gate_cmds_final[i] = "HOLD"
+                        ripple_notes[i] = "⚠ Ripple: downstream congested → HOLD"
+
+                new_open = (gate_cmds_final[i] == "OPEN")
+                if new_open != st.session_state.gate_states.get(i, False):
+                    ok = write_gate(i, new_open)
+                    if ok:
+                        action = "OPENED" if new_open else "CLOSED"
+                        log_entry = f"[{time.strftime('%H:%M:%S')}] {s.label} gate {action}"
+                        st.session_state.gate_log = (
+                            [log_entry] + st.session_state.gate_log
+                        )[:20]
+                    st.session_state.gate_states[i] = new_open
+
+        # ── Update placeholders (in-place, no DOM rebuild) ───────────────────
+
+        # Tick counter
+        ph_tick.markdown(f"""
         <div style='text-align:right;padding-top:8px'>
         <span style='font-family:JetBrains Mono;font-size:12px;color:#475569'>
         TICK #{st.session_state.tick:05d} &nbsp;·&nbsp; {time.strftime("%H:%M:%S")}
         </span></div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-    # ── TOP ROW: Video feeds ─────────────────────────────────────────────────
-    vid_cols = st.columns(3)
-    for i, (col, s) in enumerate(zip(vid_cols, states)):
-        with col:
+        # Video feeds
+        for i, s in enumerate(states):
             border = s.color
-            st.markdown(f"""
-            <div style='border:3px solid {border};border-radius:12px;
-                        overflow:hidden;margin-bottom:6px;
-                        box-shadow:0 0 20px {border}44'>""",
-                        unsafe_allow_html=True)
             if s.frame_rgb is not None:
                 thumb = cv2.resize(s.frame_rgb, (400, 225))
-                st.image(thumb, width="stretch")
-            st.markdown("</div>", unsafe_allow_html=True)
+                ph_videos[i].image(thumb, width="stretch")
+            ph_zone_info[i].markdown(zone_info_html(s), unsafe_allow_html=True)
 
-            # Zone info
-            st.markdown(f"""
-            <div style='display:flex;justify-content:space-between;
-                        align-items:center;padding:6px 2px'>
-                <span style='font-weight:700;font-size:14px;color:#e2e8f0'>
-                    {s.label}
-                </span>
-                <span style='background:{border}22;color:{border};
-                             padding:2px 10px;border-radius:12px;
-                             font-size:11px;font-weight:700;
-                             border:1px solid {border}55'>
-                    {s.status}
-                </span>
-            </div>
-            <div style='display:flex;gap:8px;margin:4px 0'>
-                <div style='flex:1;background:#0f1628;border-radius:8px;
-                            padding:8px 10px;border:1px solid #1e2d4a'>
-                    <div style='font-size:10px;color:#64748b'>CRS Score</div>
-                    <div style='font-size:20px;font-weight:800;
-                                font-family:JetBrains Mono;color:{border}'>
-                        {s.risk:.3f}
-                    </div>
-                </div>
-                <div style='flex:1;background:#0f1628;border-radius:8px;
-                            padding:8px 10px;border:1px solid #1e2d4a'>
-                    <div style='font-size:10px;color:#64748b'>Heads (raw→corr)</div>
-                    <div style='font-size:14px;font-weight:700;
-                                font-family:JetBrains Mono;color:#e2e8f0'>
-                        {s.head_count} → {int(s.head_count * s.kappa)}
-                    </div>
-                </div>
-                <div style='flex:1;background:#0f1628;border-radius:8px;
-                            padding:8px 10px;border:1px solid #1e2d4a'>
-                    <div style='font-size:10px;color:#64748b'>κ (ρ-corr)</div>
-                    <div style='font-size:20px;font-weight:800;
-                                font-family:JetBrains Mono;color:#94a3b8'>
-                        {s.kappa:.2f}
-                    </div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+        # GRS gauge
+        tick = st.session_state.tick
+        with ph_gauge.container():
+            st.plotly_chart(make_gauge(grs, "GRS", grs_color),
+                            width="stretch", config={"displayModeBar": False},
+                            key=f"grs_gauge_{tick}")
 
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-
-    # ── MIDDLE ROW: GRS + Charts + Gates ────────────────────────────────────
-    left, mid, right = st.columns([2, 4, 2])
-
-    with left:
-        # GRS Gauge
-        st.markdown('<div class="section-header">Global Risk Score</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(make_gauge(grs, "GRS", grs_color),
-                        width="stretch", config={"displayModeBar": False})
-
-        # Triage list
-        st.markdown('<div class="section-header">Zone Triage (↑ Risk)</div>',
-                    unsafe_allow_html=True)
+        # Zone triage
         sorted_states = sorted(states, key=lambda s: s.risk, reverse=True)
+        triage_html = ""
         for rank, s in enumerate(sorted_states, 1):
             bar_w = int(s.risk * 100)
-            st.markdown(f"""
+            triage_html += f"""
             <div style='display:flex;align-items:center;gap:8px;margin:4px 0;
                         background:#0f1628;border-radius:8px;padding:8px 12px;
                         border:1px solid #1e2d4a'>
@@ -538,14 +630,13 @@ def render_dashboard(processors: list[ZoneProcessor]):
                              color:{s.color};width:40px;text-align:right'>
                     {s.risk:.3f}
                 </span>
-            </div>""", unsafe_allow_html=True)
+            </div>"""
+        ph_triage.markdown(triage_html, unsafe_allow_html=True)
 
         # Marshal demand
         marshal_col = {"ADEQUATE": "#22c55e", "STRAINED": "#f59e0b",
                        "CRITICAL": "#ef4444"}[marshal_status]
-        st.markdown('<div class="section-header">Resource Demand</div>',
-                    unsafe_allow_html=True)
-        st.markdown(f"""
+        ph_marshal.markdown(f"""
         <div style='background:#0f1628;border-radius:12px;padding:16px;
                     border:1px solid #1e2d4a;text-align:center'>
             <div style='font-size:40px;font-weight:800;font-family:JetBrains Mono;
@@ -563,118 +654,82 @@ def render_dashboard(processors: list[ZoneProcessor]):
             </div>
         </div>""", unsafe_allow_html=True)
 
-    with mid:
         # Risk timeline
-        st.markdown('<div class="section-header">CA-CRS⁺ Risk Score — Live Timeline</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(make_risk_chart(states),
-                        width="stretch", config={"displayModeBar": False})
+        with ph_timeline.container():
+            st.plotly_chart(make_risk_chart(states),
+                            width="stretch",
+                            config={"displayModeBar": False},
+                            key=f"risk_timeline_{tick}")
 
-        # Causal breakdown
-        st.markdown('<div class="section-header">Causal Factor Breakdown</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(make_causal_chart(states),
-                        width="stretch", config={"displayModeBar": False})
+        # Causal chart
+        with ph_causal.container():
+            st.plotly_chart(make_causal_chart(states),
+                            width="stretch",
+                            config={"displayModeBar": False},
+                            key=f"causal_chart_{tick}")
 
-        # Model performance
-        with st.expander("📊 Calibration & Sensitivity Results", expanded=False):
-            m1, m2, m3 = st.columns(3)
-            m1.metric("κ(ρ) R²", "0.615", "▲ vs YOLO-person")
-            m2.metric("Head Det. Rate", "83.8%", "ShanghaiTech A")
-            m3.metric("PETS2009 Acc.", "75%", "DANGER classification")
-            kappa_params = json.loads(
-                (ROOT / "outputs/calibration/kappa_params_density.json").read_text()
-            )
-            st.markdown(f"""
-            **κ(ρ) = 1 + {kappa_params['alpha0']} · ρ^{kappa_params['gamma']}**
-            — calibrated on {kappa_params['n_samples_total']:,} images (ShanghaiTech A/B + UCF-QNRF).
-            β-based fitting R² = {kappa_params['metrics']['beta_r2']:.3f} (useless);
-            ρ-based R² = {kappa_params['metrics']['r2']:.3f} ✓
-            """)
-
-    with right:
-        # Gate control panel
-        plc_online = is_plc_running()
-        plc_status_txt = "🟢 PLC ONLINE" if plc_online else "🟡 PLC CONNECTING"
-        st.markdown(f'<div class="section-header">Gate Control &nbsp; <span style="float:right;font-size:10px;color:{"#22c55e" if plc_online else "#f59e0b"}">{plc_status_txt}</span></div>',
-                    unsafe_allow_html=True)
-
+        # Gate status panel
         gate_labels = ["Entry Corridor Gate", "Central Plaza Gate", "Exit Gate"]
+        gates_html = ""
+        cmd_emoji = {"OPEN": "🔓", "CLOSE": "🔒", "REDIRECT": "↪", "HOLD": "⏸"}
+        cmd_colors = {
+            "OPEN":     ("#22c55e", "rgba(34,197,94,0.12)"),
+            "CLOSE":    ("#ef4444", "rgba(239,68,68,0.12)"),
+            "REDIRECT": ("#f59e0b", "rgba(245,158,11,0.12)"),
+            "HOLD":     ("#64748b", "rgba(100,116,139,0.12)"),
+        }
         for i, (s, label, cmd, note) in enumerate(
             zip(states, gate_labels, gate_cmds_final, ripple_notes)
         ):
             is_open = st.session_state.gate_states.get(i, False)
-            status_icon = "🟢" if is_open else "🔴"
-            cmd_emoji = {"OPEN": "🔓", "CLOSE": "🔒", "REDIRECT": "↪", "HOLD": "⏸"}
-            with st.container():
-                col_dot, col_label, col_cmd = st.columns([1, 4, 3])
-                with col_dot:
-                    st.markdown(f"<div style='font-size:18px;padding-top:8px'>{status_icon}</div>",
-                                unsafe_allow_html=True)
-                with col_label:
-                    st.markdown(f"<div style='font-size:12px;font-weight:600;color:#e2e8f0;padding-top:10px'>{label}</div>",
-                                unsafe_allow_html=True)
-                    if note:
-                        st.caption(note)
-                with col_cmd:
-                    cmd_color_map = {"OPEN": "green", "CLOSE": "red",
-                                     "REDIRECT": "orange", "HOLD": "gray"}
-                    st.markdown(
-                        f"<div style='text-align:right;padding-top:6px'>"
-                        f"<span style='font-family:monospace;font-weight:700;"
-                        f"font-size:13px;color:{s.gate_color};background:rgba(0,0,0,0.3);"
-                        f"padding:3px 8px;border-radius:5px'>"
-                        f"{cmd_emoji.get(cmd,'⏸')} {cmd}</span></div>",
-                        unsafe_allow_html=True,
-                    )
-            st.markdown("<hr style='margin:4px 0;border-color:#1e2d4a'>",
-                        unsafe_allow_html=True)
+            dot_color = "#22c55e" if is_open else "#ef4444"
+            cc, cbg = cmd_colors.get(cmd, cmd_colors["HOLD"])
+            ripple = (f"<br><span style='font-size:10px;color:#f59e0b'>{note}</span>"
+                      if note else "")
+            gates_html += f"""
+            <div style='display:flex;align-items:center;gap:10px;
+                        background:#0f1628;border-radius:10px;padding:10px 14px;
+                        margin:5px 0;border:1px solid #1e2d4a'>
+                <div style='width:12px;height:12px;border-radius:50%;
+                            background:{dot_color};box-shadow:0 0 8px {dot_color};
+                            flex-shrink:0'></div>
+                <div style='flex:1'>
+                    <div style='font-weight:600;font-size:12px;color:#e2e8f0'>{label}</div>
+                    {ripple}
+                </div>
+                <div style='font-family:JetBrains Mono;font-weight:700;
+                            font-size:12px;color:{cc};background:{cbg};
+                            padding:3px 8px;border-radius:6px'>
+                    {cmd_emoji.get(cmd,'⏸')} {cmd}
+                </div>
+            </div>"""
+        ph_gates.markdown(gates_html, unsafe_allow_html=True)
 
-        # Manual override
-        st.markdown('<div class="section-header">Manual Override</div>',
-                    unsafe_allow_html=True)
-        for i, (s, lbl) in enumerate(zip(states, ["A", "B", "C"])):
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button(f"🔓 Z{lbl}", key=f"open_{i}",
-                             width="stretch"):
-                    write_gate(i, True)
-                    st.session_state.gate_states[i] = True
-            with c2:
-                if st.button(f"🔒 Z{lbl}", key=f"close_{i}",
-                             width="stretch"):
-                    write_gate(i, False)
-                    st.session_state.gate_states[i] = False
-
-        # Gate event log
+        # Gate log
         if st.session_state.gate_log:
-            st.markdown('<div class="section-header">Gate Event Log</div>',
-                        unsafe_allow_html=True)
-            for entry in st.session_state.gate_log[:6]:
-                st.caption(entry)
+            log_html = "".join(
+                f"<div style='font-size:11px;color:#64748b;padding:2px 0;font-family:JetBrains Mono'>{e}</div>"
+                for e in st.session_state.gate_log[:6]
+            )
+            ph_gate_log.markdown(log_html, unsafe_allow_html=True)
 
-    # ── BOTTOM ROW: Edge telemetry ───────────────────────────────────────────
-    st.markdown('<div class="section-header">Edge Hardware Telemetry</div>',
-                unsafe_allow_html=True)
-    t1, t2, t3, t4, t5, t6 = st.columns(6)
+        # Telemetry
+        proc = psutil.Process()
+        mem_mb = proc.memory_info().rss / 1024 / 1024
+        cpu_pct = psutil.cpu_percent(interval=None)
+        sys_mem = psutil.virtual_memory()
+        avg_fps = np.mean([s.fps for s in states])
 
-    proc = psutil.Process()
-    mem_mb = proc.memory_info().rss / 1024 / 1024
-    cpu_pct = psutil.cpu_percent(interval=None)
-    sys_mem = psutil.virtual_memory()
-
-    avg_fps = np.mean([s.fps for s in states])
-    telems = [
-        (t1, "Avg FPS", f"{avg_fps:.1f}", "#6366f1"),
-        (t2, "CPU", f"{cpu_pct:.0f}%", "#06b6d4"),
-        (t3, "Process RAM", f"{mem_mb:.0f} MB", "#f59e0b"),
-        (t4, "Sys RAM Used", f"{sys_mem.percent:.0f}%", "#ec4899"),
-        (t5, "Active Zones", f"{len(states)}", "#22c55e"),
-        (t6, "Total Heads", f"{total_heads}", "#94a3b8"),
-    ]
-    for col, label, val, color in telems:
-        with col:
-            st.markdown(f"""
+        telem_data = [
+            ("Avg FPS",      f"{avg_fps:.1f}",        "#6366f1"),
+            ("CPU",          f"{cpu_pct:.0f}%",        "#06b6d4"),
+            ("Process RAM",  f"{mem_mb:.0f} MB",       "#f59e0b"),
+            ("Sys RAM Used", f"{sys_mem.percent:.0f}%","#ec4899"),
+            ("Active Zones", f"{len(states)}",         "#22c55e"),
+            ("Total Heads",  f"{total_heads}",         "#94a3b8"),
+        ]
+        for ph, (label, val, color) in zip(ph_telemetry, telem_data):
+            ph.markdown(f"""
             <div style='background:#0f1628;border-radius:10px;padding:12px;
                         border:1px solid #1e2d4a;text-align:center'>
                 <div style='font-size:10px;color:#64748b;
@@ -682,6 +737,9 @@ def render_dashboard(processors: list[ZoneProcessor]):
                 <div style='font-size:22px;font-weight:800;font-family:JetBrains Mono;
                             color:{color};margin-top:4px'>{val}</div>
             </div>""", unsafe_allow_html=True)
+
+        # Frame pacing
+        time.sleep(0.05)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -705,12 +763,14 @@ def main():
                     ("zone_c", ZONE_LABELS["zone_c"], VIDEO_C),
                 ]
                 processors = []
-                for zid, zlabel, vpath in zones:
-                    if Path(vpath).exists():
+                for zid, zlabel, vsource in zones:
+                    if is_valid_source(vsource):
                         processors.append(ZoneProcessor(
-                            zid, zlabel, vpath, model,
+                            zid, zlabel, vsource, model,
                             conf=conf_thresh, imgsz=imgsz, target_fps=target_fps,
                         ))
+                    else:
+                        st.sidebar.warning(f"⚠ {zlabel}: source not found — {vsource}")
                 if processors:
                     st.session_state.processors = processors
             except Exception as e:
@@ -718,6 +778,10 @@ def main():
                 return
 
     if stop_btn:
+        # Clean shutdown of threaded streams
+        if st.session_state.processors:
+            for p in st.session_state.processors:
+                p.stop()
         st.session_state.processors = None
         st.info("Dashboard stopped. Press ▶ Start Dashboard to resume.")
         return
@@ -766,10 +830,8 @@ def main():
         """, unsafe_allow_html=True)
         return
 
-    # Main render + auto-refresh
-    render_dashboard(st.session_state.processors)
-    time.sleep(0.05)
-    st.rerun()
+    # Main render loop (flicker-free)
+    run_dashboard(st.session_state.processors)
 
 
 if __name__ == "__main__":

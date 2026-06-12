@@ -1,12 +1,17 @@
 """
 ca_crs_engine.py
 ────────────────
-Core CA-CRS+ risk scoring engine used by the dashboard.
+Core CA-CRS⁺ risk scoring engine used by the dashboard.
 Wraps SAHI + YOLOv8 head detection and computes per-zone risk scores.
+
+Production features:
+  - ThreadedStream for non-blocking frame reads (file + RTSP)
+  - Empirically calibrated κ(ρ) occlusion correction
+  - Non-linear CRS formula with exponential crush penalty
+  - Speed normalization from config (v_max = 15.0 px/frame)
 """
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +19,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+from dashboard.threaded_stream import ThreadedStream
 
 # ── Calibrated constants (from SAHI calibration 2026-06-08) ──────────────────
 KAPPA_ALPHA0  = 8.2442
@@ -29,6 +36,8 @@ RISK_LAMBDA   = 8.4915     # exponential crush sharpness
 RHO_MAX       = 7.0        # persons/m² saturation
 AREA_M2       = 50.0       # assumed zone area in m²
 CAPACITY      = int(RHO_MAX * AREA_M2)   # ≈ 350 heads → D_norm saturation
+
+V_MAX         = 15.0       # px/frame speed saturation (from config.yaml physics.v_max)
 
 THRESHOLD_WARN   = 0.35
 THRESHOLD_DANGER = 0.70
@@ -53,6 +62,7 @@ class ZoneState:
     speed:   float = 0.0       # S_norm
     conflict: float = 0.0      # C_norm
     head_count: int = 0
+    corrected_count: int = 0
     kappa:   float = 1.0
     gate_cmd: str = "HOLD"
     gate_color: str = "#22c55e"
@@ -71,7 +81,9 @@ def kappa(rho_norm: float) -> float:
 
 
 def compute_risk(D: float, S: float, C: float) -> float:
-    """CA-CRS+ non-linear risk score."""
+    """CA-CRS⁺ non-linear risk score.
+    CRS = w₁·D + w₂·S·(1−D) + γ_exp·exp(λ·(D−S)) + w₃·C
+    """
     phi = RISK_W2 * S * (1 - D) + RISK_GAMMA_EXP * np.exp(RISK_LAMBDA * (D - S))
     crs = RISK_W1 * D + phi + RISK_W3 * C
     return float(np.clip(crs, 0.0, 1.0))
@@ -87,7 +99,9 @@ def classify(risk: float) -> tuple[str, str]:
 
 
 def marshal_demand(total_heads: int) -> tuple[int, str]:
-    """Returns (n_marshals, status_label)."""
+    """Returns (n_marshals, status_label).
+    Formula: n = ⌈base + scale · ln(1 + N/50)⌉
+    """
     n = int(MARSHAL_BASE + MARSHAL_LOG_SCALE * np.log1p(total_heads / 50.0))
     if total_heads < 100:
         return n, "ADEQUATE"
@@ -98,15 +112,16 @@ def marshal_demand(total_heads: int) -> tuple[int, str]:
 
 class ZoneProcessor:
     """
-    Per-zone video processor.
-    Reads frames from a video file, runs head detection, computes risk.
+    Per-zone video processor with threaded frame reading.
+    Reads frames via ThreadedStream, runs head detection, computes risk.
+    Supports both file paths and RTSP URLs.
     """
 
     def __init__(
         self,
         zone_id: str,
         label: str,
-        video_path: str,
+        video_source: str,
         model,               # ultralytics YOLO model
         conf: float = 0.25,
         imgsz: int  = 640,
@@ -114,44 +129,32 @@ class ZoneProcessor:
     ):
         self.zone_id = zone_id
         self.label   = label
-        # Open with FFmpeg backend, single-threaded decoding to avoid the
-        # libavcodec pthread_frame async_lock assertion on macOS.
-        self.cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        # Disable FFmpeg internal threading via video fourcc / env (best-effort)
-        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        self.source  = video_source
+
+        # Threaded stream handles both files and RTSP
+        self._stream = ThreadedStream(video_source, queue_size=2)
+
         self.model   = model
         self.conf    = conf
         self.imgsz   = imgsz
-        src_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.frame_interval = max(1, int(src_fps / target_fps))
-        self._frame_idx = 0
+
+        # Frame skipping for target FPS
+        src_fps = self._stream.fps
+        self._frame_skip = max(1, int(src_fps / target_fps))
+        self._frame_count = 0
+
         self._prev_positions: np.ndarray = np.zeros((0, 2))
         self._prev_time = time.time()
         self.state = ZoneState(zone_id=zone_id, label=label)
 
-    def _safe_read(self) -> tuple[bool, any]:
-        """Read next frame, looping back to start on EOF. Returns (ok, frame)."""
-        for _ in range(self.frame_interval):
-            try:
-                ret, frame = self.cap.read()
-                if not ret or frame is None or frame.size == 0:
-                    # Rewind
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = self.cap.read()
-                    if not ret or frame is None or frame.size == 0:
-                        return False, None
-            except Exception:
-                return False, None
-        return True, frame
-
-
     def _estimate_speed(self, curr_boxes: np.ndarray) -> float:
-        """Crude frame-to-frame centroid displacement → speed norm."""
+        """Frame-to-frame centroid displacement → speed norm.
+        Normalized by V_MAX (15.0 px/frame from config).
+        """
         if len(curr_boxes) == 0:
             self._prev_positions = np.zeros((0, 2))
             return 0.0
-        # Always compute centroids from boxes [x1,y1,x2,y2] → [cx,cy]
+        # Compute centroids from boxes [x1,y1,x2,y2] → [cx,cy]
         curr_c = np.stack([
             (curr_boxes[:, 0] + curr_boxes[:, 2]) / 2,
             (curr_boxes[:, 1] + curr_boxes[:, 3]) / 2,
@@ -163,11 +166,10 @@ class ZoneProcessor:
         dists = np.linalg.norm(curr_c[:n] - self._prev_positions[:n], axis=1)
         speed_px = float(dists.mean()) if n > 0 else 0.0
         self._prev_positions = curr_c
-        return float(np.clip(speed_px / 30.0, 0.0, 1.0))
+        return float(np.clip(speed_px / V_MAX, 0.0, 1.0))
 
     def _estimate_conflict(self, boxes: np.ndarray) -> float:
-        """Rough conflict: fraction of boxes whose y-velocities oppose majority."""
-        # Simplified: use x-spread of centroids as proxy for bidirectional flow
+        """Rough conflict: x-spread of centroids as proxy for bidirectional flow."""
         if len(boxes) < 4:
             return 0.0
         cx = boxes[:, 0] + (boxes[:, 2] - boxes[:, 0]) / 2
@@ -177,8 +179,14 @@ class ZoneProcessor:
     def process_frame(self) -> ZoneState:
         t0 = time.time()
 
-        ok, frame = self._safe_read()
+        # Non-blocking read from threaded stream
+        ok, frame = self._stream.read()
         if not ok or frame is None:
+            return self.state
+
+        # Frame skipping for target FPS
+        self._frame_count += 1
+        if self._frame_count % self._frame_skip != 0:
             return self.state
 
         # Run YOLO head detection (skip corrupt frames gracefully)
@@ -217,6 +225,7 @@ class ZoneProcessor:
         s.speed    = round(S_norm, 4)
         s.conflict = round(C_norm, 4)
         s.head_count = head_count
+        s.corrected_count = int(corrected_count)
         s.kappa    = round(kap, 3)
         s.status   = status
         s.color    = color
@@ -225,7 +234,7 @@ class ZoneProcessor:
         s.fps      = round(fps, 1)
         s.frame_rgb = frame_rgb
 
-        MAXHIST = 120
+        MAXHIST = 150
         s.risk_history    = (s.risk_history    + [risk_val])[-MAXHIST:]
         s.density_history = (s.density_history + [D_norm  ])[-MAXHIST:]
         s.speed_history   = (s.speed_history   + [S_norm  ])[-MAXHIST:]
@@ -256,6 +265,10 @@ class ZoneProcessor:
         cv2.putText(frame, f"CRS: {risk:.3f}  [{status}]",
                     (12, 62), font, 0.85, c, 2)
         return frame
+
+    def stop(self):
+        """Cleanly stop the threaded stream."""
+        self._stream.stop()
 
 
 def compute_grs(zone_states: list[ZoneState]) -> float:
