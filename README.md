@@ -36,8 +36,18 @@ CA-CRS⁺ is an **edge AI safety system** that:
 git clone https://github.com/YOUR_USERNAME/CA-CRS-Research.git
 cd CA-CRS-Research
 
+# Create a virtual environment
 python3 -m venv .venv
+
+# Activate it:
+# On macOS/Linux:
 source .venv/bin/activate
+# On Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# On Windows (CMD):
+.venv\Scripts\activate.bat
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -64,11 +74,21 @@ Place three crowd video files (MP4):
 Or edit the paths in the dashboard sidebar.
 
 ### 4. Launch the dashboard
-```bash
-bash run_dashboard.sh
-# Open: http://localhost:8501
-# Click ▶ Start Dashboard
-```
+
+* **On macOS/Linux**:
+  ```bash
+  bash run_dashboard.sh
+  ```
+* **On Windows (PowerShell)**:
+  ```powershell
+  .\run_dashboard.ps1
+  ```
+* **On Windows (CMD)**:
+  ```cmd
+  run_dashboard.bat
+  ```
+
+Once launched, open **http://localhost:8501** in your browser and click **▶ Start Dashboard**.
 
 ---
 
@@ -88,7 +108,9 @@ CA-CRS-Research/
 │
 ├── config.yaml             # All tunable parameters
 ├── requirements.txt        # Python dependencies
-└── run_dashboard.sh        # One-command launcher
+├── run_dashboard.sh        # Linux/macOS launcher
+├── run_dashboard.ps1       # Windows PowerShell launcher
+└── run_dashboard.bat       # Windows CMD launcher
 ```
 
 ---
