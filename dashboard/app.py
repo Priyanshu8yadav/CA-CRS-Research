@@ -483,65 +483,50 @@ def zone_info_html(s: ZoneState) -> str:
     border = s.color
     dom_pct = s.causal_ratios.get(s.dominant_cause, 0.0) * 100
     peak_color = "#ef4444" if s.peak_risk >= 0.70 else "#f59e0b" if s.peak_risk >= 0.35 else "#22c55e"
-    return f"""
-    <div style='display:flex;justify-content:space-between;
-                align-items:center;padding:6px 2px'>
-        <span style='font-weight:700;font-size:14px;color:#e2e8f0'>
-            {s.label}
-        </span>
-        <div style='display:flex;gap:6px;align-items:center'>
-            <span style='background:{border}22;color:{border};
-                         padding:2px 10px;border-radius:12px;
-                         font-size:11px;font-weight:700;
-                         border:1px solid {border}55'>
-                {friendly_status(s.status)}
-            </span>
-            <span style='background:#1e2d4a;color:{peak_color};
-                         padding:2px 8px;border-radius:10px;
-                         font-size:10px;font-family:JetBrains Mono,monospace;
-                         border:1px solid {peak_color}44'
-                  title='Session peak CRS score'>
-                ▲{s.peak_risk:.3f}
-            </span>
-        </div>
-    </div>
-    <div style='display:flex;gap:8px;margin:4px 0'>
-        <div style='flex:1;background:#0f1628;border-radius:8px;
-                    padding:8px 10px;border:1px solid #1e2d4a'>
-            <div style='font-size:10px;color:#64748b'>CRS Score</div>
-            <div style='font-size:20px;font-weight:800;
-                        font-family:JetBrains Mono;color:{border}'>
-                {s.risk:.3f}
-            </div>
-        </div>
-        <div style='flex:1;background:#0f1628;border-radius:8px;
-                    padding:8px 10px;border:1px solid #1e2d4a'>
-            <div style='font-size:10px;color:#64748b'>Heads (raw→corr)</div>
-            <div style='font-size:14px;font-weight:700;
-                        font-family:JetBrains Mono;color:#e2e8f0'>
-                {s.head_count} → {s.corrected_count}
-            </div>
-        </div>
-        <div style='flex:1;background:#0f1628;border-radius:8px;
-                    padding:8px 10px;border:1px solid #1e2d4a'>
-            <div style='font-size:10px;color:#64748b'>κ(ρ)</div>
-            <div style='font-size:20px;font-weight:800;
-                        font-family:JetBrains Mono;color:#94a3b8'>
-                {s.kappa:.2f}
-            </div>
-        </div>
-    </div>
-    <div style='background:#0f1628;border-radius:6px;padding:6px 10px;
-                border:1px solid #1e2d4a;margin-top:4px;
-                font-size:11px;color:#94a3b8;display:flex;gap:6px;
-                align-items:center'>
-        <span style='color:#64748b'>Dominant Cause:</span>
-        <span style='color:{border};font-weight:700'>{s.dominant_cause}</span>
-        <span style='color:#475569'>({dom_pct:.0f}%)</span>
-        <span style='margin-left:auto;color:#64748b'>→ Gate:</span>
-        <span style='color:#e2e8f0;font-family:JetBrains Mono;font-weight:700'>{s.gate_cmd}</span>
-    </div>
-    """
+    # Compact HTML — no leading spaces on any line to prevent markdown code-block rendering
+    mixed_pct = ""
+    if s.dominant_cause == "MIXED":
+        cause_str = "MIXED"
+        pct_str   = "(no factor &gt;40%)"
+    else:
+        dom_pct   = s.causal_ratios.get(s.dominant_cause, 0.0) * 100
+        cause_str = s.dominant_cause
+        pct_str   = f"({dom_pct:.0f}%)"
+    fs = friendly_status(s.status)
+    return (
+        f"<div style='display:flex;justify-content:space-between;align-items:center;padding:6px 2px'>"
+        f"<span style='font-weight:700;font-size:14px;color:#e2e8f0'>{s.label}</span>"
+        f"<div style='display:flex;gap:6px;align-items:center'>"
+        f"<span style='background:{border}22;color:{border};padding:2px 10px;border-radius:12px;"
+        f"font-size:11px;font-weight:700;border:1px solid {border}55'>{fs}</span>"
+        f"<span style='background:#1e2d4a;color:{peak_color};padding:2px 8px;border-radius:10px;"
+        f"font-size:10px;font-family:JetBrains Mono;border:1px solid {peak_color}44' "
+        f"title='Session peak CRS score'>&#9650;{s.peak_risk:.3f}</span>"
+        f"</div></div>"
+        f"<div style='display:flex;gap:8px;margin:4px 0'>"
+        f"<div style='flex:1;background:#0f1628;border-radius:8px;padding:8px 10px;border:1px solid #1e2d4a'>"
+        f"<div style='font-size:10px;color:#64748b'>CRS Score</div>"
+        f"<div style='font-size:20px;font-weight:800;font-family:JetBrains Mono;color:{border}'>{s.risk:.3f}</div>"
+        f"</div>"
+        f"<div style='flex:1;background:#0f1628;border-radius:8px;padding:8px 10px;border:1px solid #1e2d4a'>"
+        f"<div style='font-size:10px;color:#64748b'>Heads (raw&rarr;corr)</div>"
+        f"<div style='font-size:14px;font-weight:700;font-family:JetBrains Mono;color:#e2e8f0'>"
+        f"{s.head_count} &rarr; {s.corrected_count}</div>"
+        f"</div>"
+        f"<div style='flex:1;background:#0f1628;border-radius:8px;padding:8px 10px;border:1px solid #1e2d4a'>"
+        f"<div style='font-size:10px;color:#64748b'>&kappa;(&rho;)</div>"
+        f"<div style='font-size:20px;font-weight:800;font-family:JetBrains Mono;color:#94a3b8'>{s.kappa:.2f}</div>"
+        f"</div></div>"
+        f"<div style='background:#0f1628;border-radius:6px;padding:6px 10px;"
+        f"border:1px solid #1e2d4a;margin-top:4px;font-size:11px;color:#94a3b8;"
+        f"display:flex;gap:6px;align-items:center'>"
+        f"<span style='color:#64748b'>Cause:</span>"
+        f"<span style='color:{border};font-weight:700'>{cause_str}</span>"
+        f"<span style='color:#475569'>{pct_str}</span>"
+        f"<span style='margin-left:auto;color:#64748b'>&rarr; Gate:</span>"
+        f"<span style='color:#e2e8f0;font-family:JetBrains Mono;font-weight:700'>{s.gate_cmd}</span>"
+        f"</div>"
+    )
 
 
 # ── Main dashboard loop (flicker-free with st.empty) ─────────────────────────
@@ -774,26 +759,19 @@ def run_dashboard(processors: list[ZoneProcessor]):
                             width="stretch", config={"displayModeBar": False},
                             key=f"grs_gauge_{tick}")
 
-        # Zone triage
+        # Zone triage — compact HTML, no leading whitespace (avoids markdown code-block bug)
         triage_html = ""
         sorted_states = sorted(states, key=lambda x: x.risk, reverse=True)
         for i, s in enumerate(sorted_states):
-            triage_html += f"""
-            <div class='zone-card' style='background:#0f1628;border:1px solid #1e2d4a'>
-                <div style='display:flex;justify-content:space-between;align-items:center'>
-                    <span style='color:#64748b;font-size:11px'>#{i+1}</span>
-                    <span style='font-weight:600;font-size:13px;flex:1;margin-left:12px;color:#e2e8f0'>
-                        {s.label}
-                    </span>
-                    <div style='width:60px;height:4px;background:#1e2d4a;border-radius:2px;margin:0 12px'>
-                        <div style='width:{s.risk*100}%;height:100%;background:{s.color};border-radius:2px'></div>
-                    </div>
-                    <span style='font-family:JetBrains Mono;font-weight:800;color:{s.color}'>
-                        {s.risk:.3f}
-                    </span>
-                </div>
-            </div>
-            """
+            bar_w = int(s.risk * 100)
+            triage_html += (f"<div class='zone-card' style='background:#0f1628;border:1px solid #1e2d4a'>"
+                            f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                            f"<span style='color:#64748b;font-size:11px'>#{i+1}</span>"
+                            f"<span style='font-weight:600;font-size:13px;flex:1;margin-left:12px;color:#e2e8f0'>{s.label}</span>"
+                            f"<div style='width:60px;height:4px;background:#1e2d4a;border-radius:2px;margin:0 12px'>"
+                            f"<div style='width:{bar_w}%;height:100%;background:{s.color};border-radius:2px'></div></div>"
+                            f"<span style='font-family:JetBrains Mono;font-weight:800;color:{s.color}'>{s.risk:.3f}</span>"
+                            f"</div></div>")
         ph_triage.markdown(triage_html, unsafe_allow_html=True)
 
         # Resource Demand — per-zone breakdown (Module 5)
@@ -805,29 +783,21 @@ def run_dashboard(processors: list[ZoneProcessor]):
             alpha = ALPHA_MAP[s.status]
             per_demand = _math.ceil(alpha * _math.log10(1 + s.corrected_count)) if s.corrected_count > 0 else 0
             row_color = "#ef4444" if s.status == "DANGER" else "#f59e0b" if s.status == "WARNING" else "#22c55e"
-            per_zone_rows += f"""
-            <div style='display:flex;justify-content:space-between;align-items:center;
-                        padding:4px 8px;border-bottom:1px solid #1e2d4a;font-size:11px'>
-                <span style='color:#94a3b8'>{s.label}</span>
-                <span style='color:#64748b'>α={alpha}·log₁₀(1+{s.corrected_count})</span>
-                <span style='color:{row_color};font-family:JetBrains Mono;font-weight:700'>{per_demand}</span>
-            </div>"""
-        ph_marshal.markdown(f"""
-        <div class='metric-card' style='padding:16px 20px'>
-            <div style='text-align:center'>
-                <div style='font-size:10px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase'>
-                    Active Marshals Required
-                </div>
-                <div style='font-size:42px;font-weight:800;font-family:JetBrains Mono;color:{m_color};margin:4px 0'>
-                    {n_marshals}
-                </div>
-                <div style='font-size:11px;color:{m_color};font-weight:600;margin-bottom:10px'>
-                    {marshal_status} · D_mar = Σ⌈α_l·log₁₀(1+N_k)⌉
-                </div>
-            </div>
-            {per_zone_rows}
-        </div>
-        """, unsafe_allow_html=True)
+            # Compact single-line HTML — no leading spaces to avoid markdown code-block interpretation
+            per_zone_rows += (f"<div style='display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid #1e2d4a;font-size:11px'>"
+                              f"<span style='color:#94a3b8'>{s.label}</span>"
+                              f"<span style='color:#64748b;font-family:JetBrains Mono'>&alpha;={alpha}&middot;log&#8321;&#8320;(1+{s.corrected_count})</span>"
+                              f"<span style='color:{row_color};font-family:JetBrains Mono;font-weight:800'>{per_demand}</span>"
+                              f"</div>")
+        marshal_html = (f"<div class='metric-card' style='padding:16px 20px'>"
+                        f"<div style='text-align:center;padding-bottom:10px'>"
+                        f"<div style='font-size:10px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase'>Active Marshals Required</div>"
+                        f"<div style='font-size:42px;font-weight:800;font-family:JetBrains Mono;color:{m_color};margin:4px 0'>{n_marshals}</div>"
+                        f"<div style='font-size:11px;color:{m_color};font-weight:600'>{marshal_status} &nbsp;&middot;&nbsp; D&#8347;&#8336;&#8319; = &Sigma;&lceil;&alpha;&#8343;&middot;log&#8321;&#8320;(1+N&#8342;)&rceil;</div>"
+                        f"</div>"
+                        f"{per_zone_rows}"
+                        f"</div>")
+        ph_marshal.markdown(marshal_html, unsafe_allow_html=True)
 
         # Charts
         with ph_timeline.container():
@@ -837,26 +807,21 @@ def run_dashboard(processors: list[ZoneProcessor]):
             st.plotly_chart(make_causal_chart(states), width="stretch",
                             config={"displayModeBar": False}, key=f"causal_{tick}")
 
-        # Gate status panel
+        # Gate status panel — compact single-line HTML, no leading spaces
         gate_html = ""
         for i, s in enumerate(states):
             is_open = st.session_state.gate_states.get(i, False)
             cmd_text = GATE_WORDS.get(gate_cmds_final[i], gate_cmds_final[i])
             g_color = "#22c55e" if is_open else "#ef4444"
-            rip_html = f"<div style='font-size:10px;color:#f59e0b;margin-top:2px'>↳ {ripple_notes[i]}</div>" if ripple_notes[i] else ""
-            
-            gate_html += f"""
-            <div class='gate-indicator'>
-                <div class='gate-dot' style='background:{g_color};box-shadow:0 0 10px {g_color}'></div>
-                <div style='flex:1'>
-                    <div style='font-weight:600;font-size:13px;color:#e2e8f0'>{s.label} Gate</div>
-                    <div style='font-family:JetBrains Mono;font-size:12px;color:#94a3b8'>
-                        {cmd_text}
-                        {rip_html}
-                    </div>
-                </div>
-            </div>
-            """
+            rip_part = (f"<div style='font-size:10px;color:#f59e0b;margin-top:2px'>&#8618; {ripple_notes[i]}</div>"
+                        if ripple_notes[i] else "")
+            gate_html += (f"<div class='gate-indicator'>"
+                          f"<div class='gate-dot' style='background:{g_color};box-shadow:0 0 10px {g_color}'></div>"
+                          f"<div style='flex:1'>"
+                          f"<div style='font-weight:600;font-size:13px;color:#e2e8f0'>{s.label} Gate</div>"
+                          f"<div style='font-family:JetBrains Mono;font-size:12px;color:#94a3b8'>{cmd_text}{rip_part}</div>"
+                          f"</div>"
+                          f"</div>")
         ph_gates.markdown(gate_html, unsafe_allow_html=True)
 
         # Gate Event Log
