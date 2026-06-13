@@ -4,28 +4,68 @@
 
 ---
 
-## 📸 Dashboard Preview
+## 📥 Resources & Downloads
 
-Live Streamlit command centre — 3 camera zones, Global Risk Score gauge, causal breakdown, and virtual PLC gate actuation.
+- **Video Datasets:** [Download the test video scenarios here (Google Drive)](https://drive.google.com/drive/u/1/folders/1JIDaOIGIhMhedQfAmlVUW6j5cHAvHEV-?usp=share_link)
+- **Model Weights:** The fine-tuned `yolov8n_crowd_head.pt` model is available in the **GitHub Releases** page of this repository. Please download it and place it in the `models/` folder.
 
 ---
 
-## 🧠 What It Does
+## 🧠 What It Does (The Core Problem)
 
-CA-CRS⁺ is an **edge AI safety system** that:
+Current crowd safety systems have **four fatal flaws** that have caused real disasters (Kanjuruhan 2022, Astroworld 2021, Seoul 2022):
+1. **Generic alerts:** "High density detected" — but WHERE? Which gate to open?
+2. **No causal diagnosis:** They can't tell you if the danger is *too many people*, *panic movement*, or *opposing flows*.
+3. **Wrong intervention:** Opening a gate during a speed-driven panic makes people run faster and trample each other.
+4. **No resource dispatch:** No calculation of how many marshals to send, or where.
 
-1. **Detects crowd density** using `YOLOv8n` fine-tuned for head detection + **SAHI** sliced inference for small/occluded heads
-2. **Corrects for occlusion** using an empirically calibrated κ(ρ) function:
-   ```
-   κ(ρ) = 1 + 8.2442 · ρ^1.1333    (R² = 0.615)
-   ```
-   Calibrated on 1,601 images (ShanghaiTech A/B + UCF-QNRF)
-3. **Scores crowd risk** via the CA-CRS⁺ non-linear formula:
-   ```
-   CRS = w₁·D + w₂·S·(1−D) + γ·exp(λ·(D−S)) + w₃·C
-   ```
-4. **Actuates industrial gates** via Modbus TCP (virtual PLC with ripple-lock logic)
-5. **Shows a live dashboard** with per-zone risk scores, Global Risk Score, causal breakdown, and resource demand
+**CA-CRS⁺ solves all four** in real-time, from standard CCTV cameras.
+
+> *CA-CRS⁺ watches your crowd cameras, mathematically identifies the exact cause of a developing danger, and sends the correct physical gate command to prevent a crush — all without a human in the loop.*
+
+---
+
+## ⚙️ System Architecture
+
+- **ThreadPoolExecutor:** Runs all 3 camera zones in parallel.
+- **ThreadedStream:** Reads frames in a background daemon thread (non-blocking).
+- **YOLOv8n + SAHI:** Detects visible heads even in dense crowds.
+- **Live Dashboard:** Streamlit UI updates in-place (`st.empty()`) to maintain 11-22 FPS.
+- **Modbus TCP:** Virtual PLC mapping actions directly to physical gate controllers.
+
+---
+
+## 🔬 The 6 Scientific Modules
+
+### Module 2 — Head Detection & Occlusion Correction
+Visible heads $\neq$ actual people. At 6 persons/m², ~60% of people are hidden. 
+We use our empirically tuned density correction formula $\kappa(\rho)$:
+$$\kappa(\rho) = 1 + 8.2442 \cdot \rho^{1.1333}$$
+*Calibrated on 1,601 images (ShanghaiTech A/B + UCF-QNRF) achieving $R^2 = 0.615$ (compared to the paper's original formula which had $R^2 = -0.04$).*
+
+### Module 3 — Non-Linear Risk Score (CRS)
+$$CRS_k = w_1 D + \Phi(D,S) + w_3 C$$
+Includes the **Gridlock Paradox** exponential term $\gamma \cdot e^{\lambda(D-S)}$. High density + low speed = the most dangerous state (crush verge).
+We also implemented an improved **IQR-based Conflict metric** that doesn't self-cancel when opposing flows are equal, and a **Crush Reliability Gate** that zeroes out optical flow noise when density exceeds 6 persons/m².
+
+### Module 3 — Causal Attribution
+$$r_f^{(k)} = \frac{w_f \cdot X_f}{\sum_j w_j X_j}$$
+Determines if the risk is driven by **Density**, **Speed**, or **Conflict**. If no factor dominates (>40%), it returns **MIXED**.
+
+### Module 4 — Cause-to-Gate Mapping
+Every command translates the physical intervention needed:
+- **Density** $\rightarrow$ **OPEN** exit gates (relieve pressure)
+- **Speed** $\rightarrow$ **CLOSE** entry gates (stop inflow)
+- **Conflict** $\rightarrow$ **REDIRECT** (separate opposing flows)
+- **MIXED** $\rightarrow$ **HOLD** (ambiguous, safest action is no action)
+*Ripple-effect logic:* If downstream risk > 0.50, REDIRECT is downgraded to HOLD.
+
+### Module 5 — Resource Demand
+$$D_{mar} = \sum \lceil \alpha \cdot \log_{10}(1+N) \rceil$$
+Calculates exact active marshals required per zone using base-10 logarithmic scaling, which matches real-world event staffing ratios better than linear scaling.
+
+### Module 6 — Global Risk Score (GRS)
+An urgency-weighted sum across all zones ($w_k=2$ for DANGER zones).
 
 ---
 
@@ -33,48 +73,23 @@ CA-CRS⁺ is an **edge AI safety system** that:
 
 ### 1. Clone & set up environment
 ```bash
-git clone https://github.com/YOUR_USERNAME/CA-CRS-Research.git
+git clone https://github.com/Priyanshu8yadav/CA-CRS-Research.git
 cd CA-CRS-Research
 
 # Create a virtual environment
 python3 -m venv .venv
-
-# Activate it:
-# On macOS/Linux:
-source .venv/bin/activate
-# On Windows (PowerShell):
-.venv\Scripts\Activate.ps1
-# On Windows (CMD):
-.venv\Scripts\activate.bat
+source .venv/bin/activate  # macOS/Linux
+# .venv\Scripts\Activate.ps1 # Windows PowerShell
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Download the head detection model
-```bash
-mkdir -p models
-# Download from HuggingFace:
-python -c "
-from huggingface_hub import hf_hub_download
-hf_hub_download('Ultralytics/assets', 'yolov8n.pt', local_dir='models/')
-# or your fine-tuned head detector:
-# hf_hub_download('arnabdhar/YOLOv8-Face-Detection', 'model.pt', local_dir='models/')
-"
-```
-> The model file (`yolov8n_crowd_head.pt`) is excluded from git due to size. Ask the team for the fine-tuned weights.
+### 2. Add Model and Videos
+1. Download `yolov8n_crowd_head.pt` from the **GitHub Releases** page and place it in the `models/` directory.
+2. Download the `scen_a.mp4`, `scen_b.mp4`, `scen_c.mp4` video files from the **Google Drive link** above and place them anywhere (e.g., `~/Downloads/`). Point the dashboard paths to them.
 
-### 3. Add your video feeds
-Place three crowd video files (MP4):
-```
-~/Downloads/scen_a.mp4   ← Entry Corridor
-~/Downloads/scen_b.mp4   ← Central Plaza  
-~/Downloads/scen_c.mp4   ← Exit Gate
-```
-Or edit the paths in the dashboard sidebar.
-
-### 4. Launch the dashboard
-
+### 3. Launch the dashboard
 * **On macOS/Linux**:
   ```bash
   bash run_dashboard.sh
@@ -83,78 +98,22 @@ Or edit the paths in the dashboard sidebar.
   ```powershell
   .\run_dashboard.ps1
   ```
-* **On Windows (CMD)**:
-  ```cmd
-  run_dashboard.bat
-  ```
 
-Once launched, open **http://localhost:8501** in your browser and click **▶ Start Dashboard**.
+Once launched, open **http://localhost:8501** in your browser and click **▶ Start Watching**.
 
 ---
 
-## 📁 Project Structure
-
-```
-CA-CRS-Research/
-├── dashboard/
-│   ├── app.py              # Streamlit command centre
-│   ├── ca_crs_engine.py    # YOLO inference + κ correction + risk scoring
-│   └── virtual_plc.py      # Modbus TCP virtual PLC (pymodbus 3.13+)
-│
-├── scripts/
-│   ├── calibrate_kappa.py  # Empirical κ(ρ) calibration pipeline
-│   ├── sensitivity_analysis.py
-│   └── evaluate_pets2009.py
-│
-├── config.yaml             # All tunable parameters
-├── requirements.txt        # Python dependencies
-├── run_dashboard.sh        # Linux/macOS launcher
-├── run_dashboard.ps1       # Windows PowerShell launcher
-└── run_dashboard.bat       # Windows CMD launcher
-```
-
----
-
-## 📊 Calibration Results
+## 📊 Performance Results
 
 | Metric | Value |
 |--------|-------|
-| κ(ρ) R² | 0.615 |
-| Head detection rate | 83.8% (ShanghaiTech A) |
-| PETS2009 classification accuracy | 75% |
-| Training images | 1,601 |
-| Calibration datasets | ShanghaiTech A/B + UCF-QNRF |
+| Live FPS | **11–22 frames/sec** (3 cameras × YOLO simultaneously) |
+| People tracked | **~1,085** simultaneously |
+| $\kappa(\rho)$ calibration $R^2$ | **0.615** (vs -0.04 for paper's formula) |
+| DANGER classification accuracy | **75%** (Validated on PETS2009) |
+| Head detection rate | **83.8%** (ShanghaiTech Part A) |
 
 ---
 
-## ⚙️ Risk Thresholds
-
-| Score | Status | Gate Command |
-|-------|--------|-------------|
-| < 0.35 | 🟢 SAFE | HOLD |
-| 0.35 – 0.70 | 🟡 WARNING | REDIRECT |
-| > 0.70 | 🔴 DANGER | OPEN (evacuate) |
-
-Ripple logic: if a downstream zone is also in DANGER when upstream is WARNING → override to HOLD to prevent funnel crush.
-
----
-
-## 🔧 Dependencies
-
-```
-streamlit>=1.35
-ultralytics>=8.2
-sahi>=0.11
-opencv-python
-pymodbus>=3.10
-plotly
-psutil
-numpy
-huggingface_hub
-```
-
----
-
-## 👥 Team
-
-Built for the hackathon — extend and improve as you go!
+## 👥 Team & License
+Built as an advanced industrial-grade prototype for hackathon presentation.
