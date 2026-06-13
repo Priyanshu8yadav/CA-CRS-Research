@@ -37,13 +37,13 @@ Current crowd safety systems have **four fatal flaws** that have caused real dis
 
 ## 🔬 The 6 Scientific Modules
 
-### Module 2 — Head Detection & Occlusion Correction
+### Module 1 — Head Detection & Occlusion Correction
 Visible heads $\neq$ actual people. At 6 persons/m², ~60% of people are hidden. 
 We use our empirically tuned density correction formula $\kappa(\rho)$:
 $$\kappa(\rho) = 1 + 8.2442 \cdot \rho^{1.1333}$$
 *Calibrated on 1,601 images (ShanghaiTech A/B + UCF-QNRF) achieving $R^2 = 0.615$ (compared to the paper's original formula which had $R^2 = -0.04$).*
 
-### Module 3 — Non-Linear Risk Score (CRS)
+### Module 2 — Non-Linear Risk Score (CRS)
 $$CRS_k = w_1 D + \Phi(D,S) + w_3 C$$
 Includes the **Gridlock Paradox** exponential term $\gamma \cdot e^{\lambda(D-S)}$. High density + low speed = the most dangerous state (crush verge).
 We also implemented an improved **IQR-based Conflict metric** that doesn't self-cancel when opposing flows are equal, and a **Crush Reliability Gate** that zeroes out optical flow noise when density exceeds 6 persons/m².
