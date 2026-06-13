@@ -732,16 +732,19 @@ def run_dashboard(processors: list[ZoneProcessor]):
             parts = []
             for dz in danger_zones:
                 gate_action_map = {
-                    "OPEN": "exit gates OPENED (density relief)",
-                    "CLOSE": "entry gates CLOSED (inflow stop)",
+                    "OPEN":     "exit gates OPENED (density relief)",
+                    "CLOSE":    "entry gates CLOSED (inflow stop)",
                     "REDIRECT": "crowd REDIRECTED (flow separation)",
-                    "HOLD": "gates HELD (ripple prevention)",
+                    "HOLD":     "gates HELD (ripple prevention / ambiguous cause)",
                 }
                 action_text = gate_action_map.get(dz.gate_cmd, dz.gate_cmd)
-                dom_pct = dz.causal_ratios.get(dz.dominant_cause, 0.0) * 100
+                if dz.dominant_cause == "MIXED":
+                    cause_text = "MIXED — no factor &gt; 40% (HOLD)"
+                else:
+                    dom_pct = dz.causal_ratios.get(dz.dominant_cause, 0.0) * 100
+                    cause_text = f"{dz.dominant_cause} ({dom_pct:.0f}%)"
                 parts.append(
-                    f"<strong>{dz.label}</strong> — Cause: {dz.dominant_cause} "
-                    f"({dom_pct:.0f}%) → {action_text}"
+                    f"<strong>{dz.label}</strong> — Cause: {cause_text} → {action_text}"
                 )
             alert_msg = "🚨 &nbsp;DANGER: " + " &nbsp;|&nbsp; ".join(parts)
             ph_danger_banner.markdown(f"""

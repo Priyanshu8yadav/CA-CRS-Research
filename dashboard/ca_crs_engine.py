@@ -54,10 +54,12 @@ THRESHOLD_DANGER = 0.70
 
 # ── Module 4: Cause-to-gate mapping ──────────────────────────────────────────
 # Gate command is driven by dominant causal factor, not overall status.
+# When no single factor dominates (MIXED), issue HOLD to prevent reckless action.
 CAUSE_GATE_MAP = {
     "Density":  ("OPEN",     "#ef4444"),  # relieve density → open exit
     "Speed":    ("CLOSE",    "#f59e0b"),  # stop rapid inflow → close entry
     "Conflict": ("REDIRECT", "#6366f1"),  # separate flows → redirect
+    "MIXED":    ("HOLD",     "#94a3b8"),  # no clear cause → safe default
 }
 
 # ── Module 5: Dynamic marshal multipliers by risk state ──────────────────────
@@ -120,10 +122,18 @@ def compute_risk(D: float, S: float, C: float) -> float:
 
 
 # ── Module 3: Causal attribution ─────────────────────────────────────────────
+
+# Density threshold above which C_norm is considered unreliable.
+# At ≥6 persons/m² optical flow completely breaks down (paper, Module 3 note).
+C_UNRELIABLE_DENSITY_NORM = 6.0 / RHO_MAX   # = 0.857 (6/7)
+
 def compute_causal_ratios(D: float, S: float, C: float) -> tuple[dict, str]:
     """r_f^(k) = (w_f · X_f) / Σ_j(w_j · X_j)
-    Dominant cause = argmax(r_f) if r_f > CAUSAL_DOMINANCE_THRESHOLD.
-    Returns (ratio_dict, dominant_cause_name).
+
+    Dominant cause = argmax(r_f) if and only if r_f > CAUSAL_DOMINANCE_THRESHOLD.
+    If no factor exceeds the threshold, returns 'MIXED' — which maps to HOLD.
+    This prevents the system from acting on a spurious signal when the crowd
+    behaviour is genuinely ambiguous.
     """
     weighted = {
         "Density":  RISK_W1 * D,
@@ -133,9 +143,10 @@ def compute_causal_ratios(D: float, S: float, C: float) -> tuple[dict, str]:
     denom = sum(weighted.values()) + 1e-9
     ratios = {k: round(v / denom, 4) for k, v in weighted.items()}
     dominant = max(ratios, key=ratios.get)
-    # Must exceed dominance threshold; if no factor dominates → Density (default)
-    if ratios[dominant] < CAUSAL_DOMINANCE_THRESHOLD:
-        dominant = "Density"
+    # Paper rule: dominant cause only declared if strictly > 0.40
+    # Otherwise label as MIXED — operator gets HOLD, preventing a wrong intervention
+    if ratios[dominant] <= CAUSAL_DOMINANCE_THRESHOLD:
+        dominant = "MIXED"
     return ratios, dominant
 
 
@@ -291,7 +302,15 @@ class ZoneProcessor:
         # ── Module 3: Normalized feature inputs ──────────────────────────────
         D_norm = float(np.clip(corrected_count / CAPACITY, 0.0, 1.0))
         S_norm = self._estimate_speed(boxes)
-        C_norm = self._estimate_conflict(boxes)
+
+        # C_norm reliability gate (paper, Module 3):
+        # At density ≥6 persons/m² (D_norm ≥ 0.857), optical flow breaks down
+        # entirely due to body occlusion — C_norm becomes meaningless noise.
+        # Zero it out so only Density drives attribution in crush conditions.
+        if D_norm >= C_UNRELIABLE_DENSITY_NORM:
+            C_norm = 0.0
+        else:
+            C_norm = self._estimate_conflict(boxes)
 
         risk_val = compute_risk(D_norm, S_norm, C_norm)
         status, color = classify(risk_val)
@@ -300,7 +319,9 @@ class ZoneProcessor:
         causal_ratios, dominant_cause = compute_causal_ratios(D_norm, S_norm, C_norm)
 
         # ── Module 4: Cause-to-gate mapping ──────────────────────────────────
-        if status == "SAFE":
+        # MIXED dominant cause (no factor crossed 0.40) → always HOLD
+        # to avoid acting on an ambiguous signal.
+        if status == "SAFE" or dominant_cause == "MIXED":
             gate_cmd, gate_color = "HOLD", "#22c55e"
         else:
             gate_cmd, gate_color = CAUSE_GATE_MAP[dominant_cause]
