@@ -1,14 +1,7 @@
 """
-app.py — CA-CRS⁺ Crowd Safety Command Dashboard (Production)
-==============================================================
+app.py — Crowd Safety Watch Dashboard
+================================================
 Run with:  streamlit run dashboard/app.py
-
-Production features:
-  - Flicker-free rendering via st.empty() placeholders
-  - Threaded video stream (non-blocking, RTSP-ready)
-  - Non-blocking Modbus gate writes
-  - Emergency lockdown button
-  - RTSP URL support in sidebar
 """
 from __future__ import annotations
 
@@ -18,6 +11,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -44,8 +38,8 @@ logging.basicConfig(level=logging.WARNING)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="CA-CRS⁺ | Crowd Safety Command",
-    page_icon="🚨",
+    page_title="Crowd Safety Watch",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -170,6 +164,34 @@ div[data-testid="stImage"] img { border-radius: 10px; }
 /* Remove default padding */
 .block-container { padding-top: 1rem; padding-bottom: 0; }
 
+@keyframes alert-pulse {
+    0%, 100% { background: linear-gradient(90deg, #ef4444, #b91c1c); box-shadow: 0 0 15px rgba(239,68,68,0.5); }
+    50% { background: linear-gradient(90deg, #b91c1c, #991b1b); box-shadow: 0 0 30px rgba(239,68,68,0.85); }
+}
+.danger-banner {
+    animation: alert-pulse 1.5s infinite;
+}
+
+/* Gradient headline */
+.hero-title {
+    background: linear-gradient(90deg, #60a5fa, #34d399, #fbbf24);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+/* Soft hover lift on info cards */
+.info-card {
+    background: #0f1628;
+    border: 1px solid #1e2d4a;
+    border-radius: 12px;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.info-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+}
+
 /* Emergency button styling */
 .emergency-btn {
     background: linear-gradient(135deg, #dc2626, #991b1b) !important;
@@ -195,62 +217,101 @@ def init_session():
     if "gate_log" not in st.session_state:
         st.session_state.gate_log = []
     if "tick" not in st.session_state:
-        st.session_state.tick = 0
+        st.session_state["tick"] = 0
     if "auto_gate" not in st.session_state:
         st.session_state.auto_gate = True
+    if "master_control" not in st.session_state:
+        st.session_state.master_control = "Auto"
     if "emergency_active" not in st.session_state:
         st.session_state.emergency_active = False
+    if "manual_staff" not in st.session_state:
+        st.session_state.manual_staff = {"zone_a": 2, "zone_b": 2, "zone_c": 2}
 
 
 init_session()
 
 
+# Resolve default paths dynamically based on active user's Home / Downloads directory
+downloads_dir = Path.home() / "Downloads"
+def get_default_path(filename: str, fallback: str) -> str:
+    local_file = downloads_dir / filename
+    if local_file.exists():
+        return str(local_file)
+    return fallback
+
+VIDEO_A = get_default_path("scen_a.mp4", "C:/Users/pp/Downloads/scen_a.mp4")
+VIDEO_B = get_default_path("scen_b.mp4", "C:/Users/pp/Downloads/scen_b.mp4")
+VIDEO_C = get_default_path("scen_c.mp4", "C:/Users/pp/Downloads/scen_c.mp4")
+
+ZONE_LABELS = {
+    "zone_a": "Entry Corridor",
+    "zone_b": "Central Plaza",
+    "zone_c": "Exit Corridor",
+}
+
+
+# ── Helper: plain-English wording ─────────────────────────────────────────────
+STATUS_WORDS = {
+    "SAFE":    "✅ All Good",
+    "WARNING": "⚠️ Getting Busy",
+    "DANGER":  "🚨 Too Crowded",
+}
+
+GATE_WORDS = {
+    "OPEN":     "🔓 Open — letting people out",
+    "CLOSE":    "🔒 Closed",
+    "REDIRECT": "↪️ Sending people another way",
+    "HOLD":     "⏸️ Keeping closed for now",
+}
+
+def friendly_status(status: str) -> str:
+    return STATUS_WORDS.get(status, status)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🚨 CA-CRS⁺ Command")
-    st.markdown("**Crowd Risk Scoring System**")
+    st.markdown("## 🛡️ Crowd Safety Watch")
+    st.markdown("**Keeps an eye on the crowd and warns you before it gets too packed**")
     st.markdown("---")
 
-    st.markdown('<div class="section-header">Zone Configuration</div>',
+    st.markdown('<div class="section-header">Who is using this?</div>',
                 unsafe_allow_html=True)
+    app_mode = st.radio("Select View", ["Simple View (for everyone)", "Expert View (technical details)"], label_visibility="collapsed")
 
-    st.caption("💡 Supports local files & RTSP URLs (e.g. `rtsp://user:pass@192.168.1.100:554/stream1`)")
+    if app_mode == "Expert View (technical details)":
+        st.caption("💡 Supports local files & RTSP URLs")
+        VIDEO_A = st.text_input("Zone A Source", value=VIDEO_A)
+        VIDEO_B = st.text_input("Zone B Source", value=VIDEO_B)
+        VIDEO_C = st.text_input("Zone C Source", value=VIDEO_C)
 
-    VIDEO_A = st.text_input("Zone A — Video Source",
-                             value="/Users/riyansh/Downloads/scen_a.mp4")
-    VIDEO_B = st.text_input("Zone B — Video Source",
-                             value="/Users/riyansh/Downloads/scen_b.mp4")
-    VIDEO_C = st.text_input("Zone C — Video Source",
-                             value="/Users/riyansh/Downloads/scen_c.mp4")
+        st.markdown('<div class="section-header">Detection Settings</div>',
+                    unsafe_allow_html=True)
+        conf_thresh = st.slider("Confidence Threshold", 0.10, 0.60, 0.25, 0.05)
+        imgsz       = st.select_slider("Inference Resolution", [320, 480, 640], value=480)
+        target_fps  = st.slider("Target FPS", 2, 30, 6)
+        
+        st.markdown('<div class="section-header">Gate Control</div>',
+                    unsafe_allow_html=True)
+        auto_gate = st.toggle("Auto Gate Control", value=True)
+        st.session_state.auto_gate = auto_gate
 
-    ZONE_LABELS = {
-        "zone_a": st.text_input("Zone A Label", "Entry Corridor"),
-        "zone_b": st.text_input("Zone B Label", "Central Plaza"),
-        "zone_c": st.text_input("Zone C Label", "Exit Gate"),
-    }
+        st.markdown('<div class="section-header">Model Info</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f"""
+        <div style='font-size:12px; color:#64748b; font-family: JetBrains Mono, monospace;'>
+        κ(ρ) = 1 + {KAPPA_ALPHA0}·ρ^{KAPPA_GAMMA}<br>
+        R² = 0.615 &nbsp;|&nbsp; n=1,601 imgs<br>
+        Model: YOLOv8n + SAHI<br>
+        Datasets: SHTech A/B + UCF-QNRF
+        </div>""", unsafe_allow_html=True)
+    else:
+        # Default settings for Simple View
+        conf_thresh = 0.25
+        imgsz       = 480
+        target_fps  = 6
 
-    st.markdown('<div class="section-header">Detection Settings</div>',
-                unsafe_allow_html=True)
-    conf_thresh = st.slider("Confidence Threshold", 0.10, 0.60, 0.25, 0.05)
-    imgsz       = st.select_slider("Inference Resolution", [320, 480, 640], value=480)
-    target_fps  = st.slider("Target FPS", 2, 15, 6)
-
-    st.markdown('<div class="section-header">Gate Control</div>',
-                unsafe_allow_html=True)
-    auto_gate = st.toggle("Auto Gate Control", value=True)
-    st.session_state.auto_gate = auto_gate
-
-    st.markdown('<div class="section-header">Model Info</div>',
-                unsafe_allow_html=True)
-    st.markdown(f"""
-    <div style='font-size:12px; color:#64748b; font-family: JetBrains Mono, monospace;'>
-    κ(ρ) = 1 + {KAPPA_ALPHA0}·ρ^{KAPPA_GAMMA}<br>
-    R² = 0.615 &nbsp;|&nbsp; n=1,601 imgs<br>
-    Model: YOLOv8n + SAHI<br>
-    Datasets: SHTech A/B + UCF-QNRF
-    </div>""", unsafe_allow_html=True)
-
-    start_btn = st.button("▶ Start Dashboard", width="stretch", type="primary")
+    st.markdown("---")
+    start_btn = st.button("▶ Start Watching", width="stretch", type="primary")
     stop_btn  = st.button("⏹ Stop", width="stretch")
 
 
@@ -260,7 +321,6 @@ def load_model(model_path: str):
     from ultralytics import YOLO
     return YOLO(model_path)
 
-
 MODEL_PATH = str(ROOT / "models" / "yolov8n_crowd_head.pt")
 
 
@@ -268,7 +328,6 @@ MODEL_PATH = str(ROOT / "models" / "yolov8n_crowd_head.pt")
 _RTSP_PREFIXES = ("rtsp://", "rtsp_tcp://", "rtsps://", "http://", "https://")
 
 def is_valid_source(source: str) -> bool:
-    """Check if a video source is a valid file path or RTSP URL."""
     if any(source.lower().startswith(p) for p in _RTSP_PREFIXES):
         return True
     return Path(source).exists()
@@ -332,18 +391,18 @@ def make_risk_chart(states: list[ZoneState]) -> go.Figure:
         ))
 
     fig.add_hline(y=THRESHOLD_WARN,   line=dict(color="#f59e0b", dash="dash", width=1.5),
-                  annotation_text="WARNING 0.35", annotation_position="top left",
+                  annotation_text="⚠️ Getting Busy", annotation_position="top left",
                   annotation_font=dict(color="#f59e0b", size=10))
     fig.add_hline(y=THRESHOLD_DANGER, line=dict(color="#ef4444", dash="dash", width=1.5),
-                  annotation_text="DANGER 0.70", annotation_position="top left",
+                  annotation_text="🚨 Too Crowded", annotation_position="top left",
                   annotation_font=dict(color="#ef4444", size=10))
 
     fig.update_layout(
         height=240, margin=dict(l=10, r=10, t=10, b=30),
         paper_bgcolor="#0a0e1a", plot_bgcolor="#0f1628",
-        xaxis=dict(showgrid=False, color="#334155", title="Frame"),
+        xaxis=dict(showgrid=False, color="#334155", title="Time →"),
         yaxis=dict(range=[0, 1], showgrid=True, gridcolor="#1e2d4a",
-                   color="#334155", title="CRS"),
+                   color="#334155", title="Crowd Level", tickformat=".0%"),
         legend=dict(bgcolor="#0f1628", bordercolor="#1e2d4a", borderwidth=1,
                     font=dict(size=11, color="#94a3b8")),
         font=dict(family="Inter"),
@@ -358,13 +417,13 @@ def make_causal_chart(states: list[ZoneState]) -> go.Figure:
     conflict = [s.conflict for s in states]
 
     fig = go.Figure()
-    fig.add_bar(name="Density",  x=labels, y=density,
+    fig.add_bar(name="How tightly packed",  x=labels, y=density,
                 marker_color="#6366f1", text=[f"{v:.2f}" for v in density],
                 textposition="inside", textfont=dict(size=10))
-    fig.add_bar(name="Speed",    x=labels, y=speed,
+    fig.add_bar(name="How fast people move",    x=labels, y=speed,
                 marker_color="#06b6d4", text=[f"{v:.2f}" for v in speed],
                 textposition="inside", textfont=dict(size=10))
-    fig.add_bar(name="Conflict", x=labels, y=conflict,
+    fig.add_bar(name="People crossing paths", x=labels, y=conflict,
                 marker_color="#f59e0b", text=[f"{v:.2f}" for v in conflict],
                 textposition="inside", textfont=dict(size=10))
 
@@ -395,7 +454,7 @@ def zone_info_html(s: ZoneState) -> str:
                      padding:2px 10px;border-radius:12px;
                      font-size:11px;font-weight:700;
                      border:1px solid {border}55'>
-            {s.status}
+            {friendly_status(s.status)}
         </span>
     </div>
     <div style='display:flex;gap:8px;margin:4px 0'>
@@ -438,15 +497,18 @@ def run_dashboard(processors: list[ZoneProcessor]):
     col_title, col_tick = st.columns([8, 2])
     with col_title:
         st.markdown(f"""
-        <h1 style='margin:0;font-size:26px;font-weight:800;color:#f1f5f9;'>
-            🚨 CA-CRS<sup style='font-size:14px'>+</sup> Crowd Safety Command
+        <h1 class='hero-title' style='margin:0;font-size:28px;font-weight:800;'>
+            🛡️ Crowd Safety Watch
         </h1>
-        <p style='margin:2px 0 0 0;font-size:13px;color:#475569;'>
-            Real-time multi-zone crowd risk scoring &amp; gate control
+        <p style='margin:2px 0 0 0;font-size:13px;color:#64748b;'>
+            Live view of how crowded each area is — with automatic gates and clear advice
         </p>""", unsafe_allow_html=True)
     ph_tick = col_tick.empty()
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    
+    # Placeholder for Danger Banner
+    ph_danger_banner = st.empty()
 
     # ── Video feed row: create placeholders ──────────────────────────────────
     vid_cols = st.columns(3)
@@ -549,12 +611,18 @@ def run_dashboard(processors: list[ZoneProcessor]):
     telem_cols = st.columns(6)
     ph_telemetry = [col.empty() for col in telem_cols]
 
+    # Initialize ThreadPoolExecutor for parallel YOLO inference
+    executor = ThreadPoolExecutor(max_workers=3)
+
     # ═══════════════════════════════════════════════════════════════════════════
     #  LIVE UPDATE LOOP — only placeholders are updated, no DOM rebuild
     # ═══════════════════════════════════════════════════════════════════════════
     while st.session_state.processors is not None:
-        # Process one frame per zone
-        states: list[ZoneState] = [p.process_frame() for p in processors]
+        
+        # Parallel frame processing across all cameras using ThreadPoolExecutor
+        futures = [executor.submit(p.process_frame) for p in processors]
+        states: list[ZoneState] = [f.result() for f in futures]
+        
         grs = compute_grs(states)
         grs_status, grs_color = classify(grs)
         total_heads = sum(s.head_count for s in states)
@@ -566,7 +634,7 @@ def run_dashboard(processors: list[ZoneProcessor]):
         gate_cmds_final = list(gate_cmds)
         ripple_notes = ["", "", ""]
 
-        if st.session_state.auto_gate:
+        if st.session_state.auto_gate and not st.session_state.emergency_active:
             for i, s in enumerate(states):
                 # Ripple: if REDIRECT but downstream zone is DANGER → HOLD
                 if s.status == "WARNING":
@@ -592,8 +660,25 @@ def run_dashboard(processors: list[ZoneProcessor]):
         ph_tick.markdown(f"""
         <div style='text-align:right;padding-top:8px'>
         <span style='font-family:JetBrains Mono;font-size:12px;color:#475569'>
-        TICK #{st.session_state.tick:05d} &nbsp;·&nbsp; {time.strftime("%H:%M:%S")}
+        🔄 Live &nbsp;·&nbsp; {time.strftime("%H:%M:%S")}
         </span></div>""", unsafe_allow_html=True)
+
+        # Danger Banner
+        danger_zones = [s for s in states if s.status == "DANGER"]
+        if danger_zones:
+            labels_str = ", ".join([s.label for s in danger_zones])
+            alert_msg = f"🚨 &nbsp;<strong>TOO CROWDED:</strong> {labels_str} is dangerously packed. Nearby gates were closed automatically so more people don't pile in."
+            ph_danger_banner.markdown(f"""
+            <div class="danger-banner" style="
+                color: #ffffff; padding: 14px 20px; border-radius: 10px;
+                font-weight: 700; font-size: 14px; text-align: center;
+                margin-bottom: 16px; border: 1px solid rgba(255,255,255,0.15);
+            ">
+                {alert_msg}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            ph_danger_banner.empty()
 
         # Video feeds
         for i, s in enumerate(states):
@@ -611,107 +696,82 @@ def run_dashboard(processors: list[ZoneProcessor]):
                             key=f"grs_gauge_{tick}")
 
         # Zone triage
-        sorted_states = sorted(states, key=lambda s: s.risk, reverse=True)
         triage_html = ""
-        for rank, s in enumerate(sorted_states, 1):
-            bar_w = int(s.risk * 100)
+        sorted_states = sorted(states, key=lambda x: x.risk, reverse=True)
+        for i, s in enumerate(sorted_states):
             triage_html += f"""
-            <div style='display:flex;align-items:center;gap:8px;margin:4px 0;
-                        background:#0f1628;border-radius:8px;padding:8px 12px;
-                        border:1px solid #1e2d4a'>
-                <span style='color:#475569;font-size:11px;width:16px'>#{rank}</span>
-                <span style='font-size:13px;font-weight:600;color:#e2e8f0;
-                             flex:1'>{s.label}</span>
-                <div style='width:60px;background:#1e2d4a;border-radius:4px;height:6px'>
-                    <div style='width:{bar_w}%;background:{s.color};
-                                border-radius:4px;height:6px'></div>
+            <div class='zone-card' style='background:#0f1628;border:1px solid #1e2d4a'>
+                <div style='display:flex;justify-content:space-between;align-items:center'>
+                    <span style='color:#64748b;font-size:11px'>#{i+1}</span>
+                    <span style='font-weight:600;font-size:13px;flex:1;margin-left:12px;color:#e2e8f0'>
+                        {s.label}
+                    </span>
+                    <div style='width:60px;height:4px;background:#1e2d4a;border-radius:2px;margin:0 12px'>
+                        <div style='width:{s.risk*100}%;height:100%;background:{s.color};border-radius:2px'></div>
+                    </div>
+                    <span style='font-family:JetBrains Mono;font-weight:800;color:{s.color}'>
+                        {s.risk:.3f}
+                    </span>
                 </div>
-                <span style='font-family:JetBrains Mono;font-size:12px;
-                             color:{s.color};width:40px;text-align:right'>
-                    {s.risk:.3f}
-                </span>
-            </div>"""
+            </div>
+            """
         ph_triage.markdown(triage_html, unsafe_allow_html=True)
 
-        # Marshal demand
-        marshal_col = {"ADEQUATE": "#22c55e", "STRAINED": "#f59e0b",
-                       "CRITICAL": "#ef4444"}[marshal_status]
+        # Resource Demand
+        m_color = "#ef4444" if n_marshals > 6 else "#f59e0b" if n_marshals > 2 else "#22c55e"
         ph_marshal.markdown(f"""
-        <div style='background:#0f1628;border-radius:12px;padding:16px;
-                    border:1px solid #1e2d4a;text-align:center'>
-            <div style='font-size:40px;font-weight:800;font-family:JetBrains Mono;
-                        color:{marshal_col}'>{n_marshals}</div>
-            <div style='font-size:11px;color:#64748b;margin-top:2px'>
-                Marshals Required
+        <div class='metric-card' style='text-align:center;padding:24px 20px'>
+            <div style='font-size:11px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase'>
+                Active Marshals Required
             </div>
-            <div style='margin-top:8px;background:{marshal_col}22;color:{marshal_col};
-                        padding:4px 12px;border-radius:12px;font-weight:700;
-                        font-size:11px;display:inline-block;border:1px solid {marshal_col}44'>
+            <div style='font-size:48px;font-weight:800;font-family:JetBrains Mono;color:{m_color};margin:4px 0'>
+                {n_marshals}
+            </div>
+            <div style='font-size:12px;color:{m_color};font-weight:600'>
                 {marshal_status}
             </div>
-            <div style='font-size:11px;color:#475569;margin-top:6px'>
-                Total heads: {total_heads}
-            </div>
-        </div>""", unsafe_allow_html=True)
+        </div>
+        """, unsafe_allow_html=True)
 
-        # Risk timeline
+        # Charts
         with ph_timeline.container():
-            st.plotly_chart(make_risk_chart(states),
-                            width="stretch",
-                            config={"displayModeBar": False},
-                            key=f"risk_timeline_{tick}")
-
-        # Causal chart
+            st.plotly_chart(make_risk_chart(states), width="stretch",
+                            config={"displayModeBar": False}, key=f"timeline_{tick}")
         with ph_causal.container():
-            st.plotly_chart(make_causal_chart(states),
-                            width="stretch",
-                            config={"displayModeBar": False},
-                            key=f"causal_chart_{tick}")
+            st.plotly_chart(make_causal_chart(states), width="stretch",
+                            config={"displayModeBar": False}, key=f"causal_{tick}")
 
         # Gate status panel
-        gate_labels = ["Entry Corridor Gate", "Central Plaza Gate", "Exit Gate"]
-        gates_html = ""
-        cmd_emoji = {"OPEN": "🔓", "CLOSE": "🔒", "REDIRECT": "↪", "HOLD": "⏸"}
-        cmd_colors = {
-            "OPEN":     ("#22c55e", "rgba(34,197,94,0.12)"),
-            "CLOSE":    ("#ef4444", "rgba(239,68,68,0.12)"),
-            "REDIRECT": ("#f59e0b", "rgba(245,158,11,0.12)"),
-            "HOLD":     ("#64748b", "rgba(100,116,139,0.12)"),
-        }
-        for i, (s, label, cmd, note) in enumerate(
-            zip(states, gate_labels, gate_cmds_final, ripple_notes)
-        ):
+        gate_html = ""
+        for i, s in enumerate(states):
             is_open = st.session_state.gate_states.get(i, False)
-            dot_color = "#22c55e" if is_open else "#ef4444"
-            cc, cbg = cmd_colors.get(cmd, cmd_colors["HOLD"])
-            ripple = (f"<br><span style='font-size:10px;color:#f59e0b'>{note}</span>"
-                      if note else "")
-            gates_html += f"""
-            <div style='display:flex;align-items:center;gap:10px;
-                        background:#0f1628;border-radius:10px;padding:10px 14px;
-                        margin:5px 0;border:1px solid #1e2d4a'>
-                <div style='width:12px;height:12px;border-radius:50%;
-                            background:{dot_color};box-shadow:0 0 8px {dot_color};
-                            flex-shrink:0'></div>
+            cmd_text = GATE_WORDS.get(gate_cmds_final[i], gate_cmds_final[i])
+            g_color = "#22c55e" if is_open else "#ef4444"
+            rip_html = f"<div style='font-size:10px;color:#f59e0b;margin-top:2px'>↳ {ripple_notes[i]}</div>" if ripple_notes[i] else ""
+            
+            gate_html += f"""
+            <div class='gate-indicator'>
+                <div class='gate-dot' style='background:{g_color};box-shadow:0 0 10px {g_color}'></div>
                 <div style='flex:1'>
-                    <div style='font-weight:600;font-size:12px;color:#e2e8f0'>{label}</div>
-                    {ripple}
+                    <div style='font-weight:600;font-size:13px;color:#e2e8f0'>{s.label} Gate</div>
+                    <div style='font-family:JetBrains Mono;font-size:12px;color:#94a3b8'>
+                        {cmd_text}
+                        {rip_html}
+                    </div>
                 </div>
-                <div style='font-family:JetBrains Mono;font-weight:700;
-                            font-size:12px;color:{cc};background:{cbg};
-                            padding:3px 8px;border-radius:6px'>
-                    {cmd_emoji.get(cmd,'⏸')} {cmd}
-                </div>
-            </div>"""
-        ph_gates.markdown(gates_html, unsafe_allow_html=True)
+            </div>
+            """
+        ph_gates.markdown(gate_html, unsafe_allow_html=True)
 
-        # Gate log
-        if st.session_state.gate_log:
-            log_html = "".join(
-                f"<div style='font-size:11px;color:#64748b;padding:2px 0;font-family:JetBrains Mono'>{e}</div>"
-                for e in st.session_state.gate_log[:6]
-            )
-            ph_gate_log.markdown(log_html, unsafe_allow_html=True)
+        # Gate Event Log
+        log_html = "<div style='background:#0f1628;border-radius:8px;padding:12px;border:1px solid #1e2d4a;height:160px;overflow-y:auto;font-family:JetBrains Mono;font-size:11px;color:#94a3b8'>"
+        for entry in st.session_state.gate_log:
+            color = "#ef4444" if "EMERGENCY" in entry else "#22c55e" if "OPENED" in entry else "#e2e8f0"
+            log_html += f"<div style='margin-bottom:4px;color:{color}'>{entry}</div>"
+        if not st.session_state.gate_log:
+            log_html += "<div>No events yet...</div>"
+        log_html += "</div>"
+        ph_gate_log.markdown(log_html, unsafe_allow_html=True)
 
         # Telemetry
         proc = psutil.Process()
@@ -720,41 +780,31 @@ def run_dashboard(processors: list[ZoneProcessor]):
         sys_mem = psutil.virtual_memory()
         avg_fps = np.mean([s.fps for s in states])
 
-        telem_data = [
-            ("Avg FPS",      f"{avg_fps:.1f}",        "#6366f1"),
-            ("CPU",          f"{cpu_pct:.0f}%",        "#06b6d4"),
-            ("Process RAM",  f"{mem_mb:.0f} MB",       "#f59e0b"),
-            ("Sys RAM Used", f"{sys_mem.percent:.0f}%","#ec4899"),
-            ("Active Zones", f"{len(states)}",         "#22c55e"),
-            ("Total Heads",  f"{total_heads}",         "#94a3b8"),
+        telems = [
+            (ph_telemetry[0], "Camera Speed", f"{avg_fps:.1f}/sec", "#6366f1"),
+            (ph_telemetry[1], "Computer Load", f"{cpu_pct:.0f}%", "#06b6d4"),
+            (ph_telemetry[2], "App Memory", f"{mem_mb:.0f} MB", "#f59e0b"),
+            (ph_telemetry[3], "PC Memory Used", f"{sys_mem.percent:.0f}%", "#ec4899"),
+            (ph_telemetry[4], "Cameras Running", f"{len(states)}", "#22c55e"),
+            (ph_telemetry[5], "People in View", f"~{total_heads}", "#94a3b8"),
         ]
-        for ph, (label, val, color) in zip(ph_telemetry, telem_data):
-            ph.markdown(f"""
-            <div style='background:#0f1628;border-radius:10px;padding:12px;
-                        border:1px solid #1e2d4a;text-align:center'>
-                <div style='font-size:10px;color:#64748b;
-                            letter-spacing:1px;text-transform:uppercase'>{label}</div>
-                <div style='font-size:22px;font-weight:800;font-family:JetBrains Mono;
-                            color:{color};margin-top:4px'>{val}</div>
-            </div>""", unsafe_allow_html=True)
 
-        # Frame pacing
-        time.sleep(0.05)
+        for ph, label, val, color in telems:
+            ph.markdown(f"""
+            <div class='info-card' style='padding:12px;text-align:center'>
+                <div style='font-size:10px;color:#64748b;letter-spacing:1px;text-transform:uppercase'>{label}</div>
+                <div style='font-size:22px;font-weight:800;font-family:JetBrains Mono;color:{color};margin-top:4px'>{val}</div>
+            </div>""", unsafe_allow_html=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    # Start virtual PLC
     if not st.session_state.plc_started:
-        try:
-            start_plc_server()
-            st.session_state.plc_started = True
-        except Exception:
-            pass
+        start_plc_server()
+        st.session_state.plc_started = True
 
-    # Initialize processors
-    if start_btn or (st.session_state.processors is None and not stop_btn):
-        if start_btn or st.session_state.processors is None:
+    if start_btn:
+        with st.spinner("Initializing neural engine and allocating threaded streams..."):
             try:
                 model = load_model(MODEL_PATH)
                 zones = [
@@ -763,67 +813,64 @@ def main():
                     ("zone_c", ZONE_LABELS["zone_c"], VIDEO_C),
                 ]
                 processors = []
-                for zid, zlabel, vsource in zones:
-                    if is_valid_source(vsource):
+                for zid, zlabel, vpath in zones:
+                    if is_valid_source(vpath):
                         processors.append(ZoneProcessor(
-                            zid, zlabel, vsource, model,
+                            zid, zlabel, vpath, model,
                             conf=conf_thresh, imgsz=imgsz, target_fps=target_fps,
                         ))
                     else:
-                        st.sidebar.warning(f"⚠ {zlabel}: source not found — {vsource}")
+                        st.sidebar.warning(f"⚠ {zlabel}: source not found — {vpath}")
                 if processors:
                     st.session_state.processors = processors
             except Exception as e:
-                st.error(f"Failed to initialize: {e}")
+                st.error(f"Failed to start: {e}")
                 return
 
     if stop_btn:
-        # Clean shutdown of threaded streams
         if st.session_state.processors:
             for p in st.session_state.processors:
                 p.stop()
         st.session_state.processors = None
-        st.info("Dashboard stopped. Press ▶ Start Dashboard to resume.")
+        st.info("Stopped. Press ▶ Start Watching in the sidebar to begin again.")
         return
 
     if st.session_state.processors is None:
         # Welcome screen
         st.markdown("""
         <div style='text-align:center;padding:80px 40px'>
-            <div style='font-size:64px'>🚨</div>
-            <h1 style='color:#f1f5f9;font-size:36px;font-weight:800;margin:16px 0'>
-                CA-CRS⁺ Crowd Safety Command
+            <div style='font-size:64px'>🛡️</div>
+            <h1 class='hero-title' style='font-size:38px;font-weight:800;margin:16px 0'>
+                Crowd Safety Watch
             </h1>
-            <p style='color:#64748b;font-size:16px;max-width:600px;margin:0 auto'>
-                Real-time multi-zone crowd risk scoring with SAHI head detection,
-                empirically calibrated κ(ρ) correction, and Modbus TCP gate control.
-                Configure your zones in the sidebar and press <strong>▶ Start</strong>.
+            <p style='color:#94a3b8;font-size:17px;max-width:620px;margin:0 auto;line-height:1.6'>
+                This dashboard watches your camera feeds, counts how many people
+                are in each area, and warns you <strong>before</strong> a spot gets
+                dangerously packed. It can even open and close gates on its own.<br><br>
+                Set up your cameras in the sidebar, then press
+                <strong style='color:#34d399'>▶ Start Watching</strong>.
             </p>
-            <div style='margin-top:32px;display:flex;gap:24px;
+            <div style='margin-top:36px;display:flex;gap:24px;
                         justify-content:center;flex-wrap:wrap'>
-                <div style='background:#0f1628;border-radius:12px;padding:20px 28px;
-                            border:1px solid #1e2d4a;min-width:160px'>
-                    <div style='font-size:28px;font-weight:800;color:#6366f1;
-                                font-family:JetBrains Mono'>0.615</div>
-                    <div style='font-size:12px;color:#64748b'>κ(ρ) R²</div>
+                <div class='info-card' style='padding:20px 28px;min-width:170px'>
+                    <div style='font-size:34px'>👀</div>
+                    <div style='font-size:14px;font-weight:700;color:#e2e8f0;margin-top:6px'>Counts People</div>
+                    <div style='font-size:12px;color:#64748b;margin-top:4px'>Watches 3 areas live and counts everyone, even people hidden behind others</div>
                 </div>
-                <div style='background:#0f1628;border-radius:12px;padding:20px 28px;
-                            border:1px solid #1e2d4a;min-width:160px'>
-                    <div style='font-size:28px;font-weight:800;color:#06b6d4;
-                                font-family:JetBrains Mono'>1,601</div>
-                    <div style='font-size:12px;color:#64748b'>Training Images</div>
+                <div class='info-card' style='padding:20px 28px;min-width:170px'>
+                    <div style='font-size:34px'>⚠️</div>
+                    <div style='font-size:14px;font-weight:700;color:#e2e8f0;margin-top:6px'>Warns You Early</div>
+                    <div style='font-size:12px;color:#64748b;margin-top:4px'>Shows a simple color code — green is fine, yellow is busy, red is danger</div>
                 </div>
-                <div style='background:#0f1628;border-radius:12px;padding:20px 28px;
-                            border:1px solid #1e2d4a;min-width:160px'>
-                    <div style='font-size:28px;font-weight:800;color:#22c55e;
-                                font-family:JetBrains Mono'>83.8%</div>
-                    <div style='font-size:12px;color:#64748b'>Head Det. Rate</div>
+                <div class='info-card' style='padding:20px 28px;min-width:170px'>
+                    <div style='font-size:34px'>🚪</div>
+                    <div style='font-size:14px;font-weight:700;color:#e2e8f0;margin-top:6px'>Controls Gates</div>
+                    <div style='font-size:12px;color:#64748b;margin-top:4px'>Opens and closes gates automatically to keep people flowing safely</div>
                 </div>
-                <div style='background:#0f1628;border-radius:12px;padding:20px 28px;
-                            border:1px solid #1e2d4a;min-width:160px'>
-                    <div style='font-size:28px;font-weight:800;color:#f59e0b;
-                                font-family:JetBrains Mono'>Modbus</div>
-                    <div style='font-size:12px;color:#64748b'>TCP Gate Control</div>
+                <div class='info-card' style='padding:20px 28px;min-width:170px'>
+                    <div style='font-size:34px'>🦺</div>
+                    <div style='font-size:14px;font-weight:700;color:#e2e8f0;margin-top:6px'>Suggests Staff</div>
+                    <div style='font-size:12px;color:#64748b;margin-top:4px'>Tells you how many safety staff you need and where to send them</div>
                 </div>
             </div>
         </div>
