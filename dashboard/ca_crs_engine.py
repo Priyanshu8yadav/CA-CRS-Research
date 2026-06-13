@@ -1,17 +1,21 @@
 """
 ca_crs_engine.py
 ────────────────
-Core CA-CRS⁺ risk scoring engine used by the dashboard.
-Wraps SAHI + YOLOv8 head detection and computes per-zone risk scores.
+Core CA-CRS⁺ risk scoring engine — paper-aligned (Modules 2–6).
 
-Production features:
-  - ThreadedStream for non-blocking frame reads (file + RTSP)
-  - Empirically calibrated κ(ρ) occlusion correction
-  - Non-linear CRS formula with exponential crush penalty
-  - Speed normalization from config (v_max = 15.0 px/frame)
+Module 2  — Detection & Occlusion Correction: κ(ρ) = 1 + α₀·ρ^γ
+Module 3  — Non-linear risk score + causal attribution r_f
+Module 4  — Cause-to-gate mapping + ripple-effect prevention (threshold > 0.50)
+Module 5  — Logarithmic marshal demand: D_mar = ⌈α_l · log₁₀(1 + N_k)⌉
+Module 6  — Urgency-weighted GRS: w_k=2 for DANGER, w_k=1 otherwise
+
+Empirically tuned values (calibration 2026-06-08, n=1,601 images, R²=0.615):
+  κ: α₀=8.2442, γ=1.1333
+  Risk: w1=0.40, w2=0.30, w3=0.30, γ_exp=0.01, λ=8.4915
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,75 +26,121 @@ import numpy as np
 
 from dashboard.threaded_stream import ThreadedStream
 
-# ── Calibrated constants (from SAHI calibration 2026-06-08) ──────────────────
+# ── Module 2: Calibrated κ(ρ) constants ──────────────────────────────────────
 KAPPA_ALPHA0  = 8.2442
 KAPPA_GAMMA   = 1.1333
-KAPPA_MAX_GT  = 3138       # max GT count seen during calibration
 
-RISK_W1       = 0.40       # density weight
-RISK_W2       = 0.30       # speed/gridlock weight
-RISK_W3       = 0.30       # conflict weight
-RISK_GAMMA_EXP = 0.01      # exponential crush amplitude
-RISK_LAMBDA   = 8.4915     # exponential crush sharpness
+# ── Module 3: Non-linear risk score weights ───────────────────────────────────
+RISK_W1        = 0.40     # density weight
+RISK_W2        = 0.30     # speed/gridlock weight
+RISK_W3        = 0.30     # conflict weight
+RISK_GAMMA_EXP = 0.01     # exponential crush amplitude
+RISK_LAMBDA    = 8.4915   # exponential crush sharpness
 
-RHO_MAX       = 7.0        # persons/m² saturation
-AREA_M2       = 50.0       # assumed zone area in m²
-CAPACITY      = int(RHO_MAX * AREA_M2)   # ≈ 350 heads → D_norm saturation
+# Causal dominance threshold (Module 3 spec)
+CAUSAL_DOMINANCE_THRESHOLD = 0.40
 
-V_MAX         = 15.0       # px/frame speed saturation (from config.yaml physics.v_max)
+# ── Zone capacity constants (Module 2 fix) ────────────────────────────────────
+RHO_MAX   = 7.0     # persons/m² — saturation density
+AREA_M2   = 50.0    # assumed zone area in m²
+CAPACITY  = int(RHO_MAX * AREA_M2)  # = 350 heads — used as ρ denominator
 
+# ── Speed saturation ──────────────────────────────────────────────────────────
+V_MAX = 15.0   # px/frame speed saturation (from config.yaml physics.v_max)
+
+# ── Risk thresholds ───────────────────────────────────────────────────────────
 THRESHOLD_WARN   = 0.35
 THRESHOLD_DANGER = 0.70
 
-GATE_COMMANDS = {
-    "SAFE":    ("HOLD",     "#22c55e"),
-    "WARNING": ("REDIRECT", "#f59e0b"),
-    "DANGER":  ("OPEN",     "#ef4444"),
+# ── Module 4: Cause-to-gate mapping ──────────────────────────────────────────
+# Gate command is driven by dominant causal factor, not overall status.
+CAUSE_GATE_MAP = {
+    "Density":  ("OPEN",     "#ef4444"),  # relieve density → open exit
+    "Speed":    ("CLOSE",    "#f59e0b"),  # stop rapid inflow → close entry
+    "Conflict": ("REDIRECT", "#6366f1"),  # separate flows → redirect
 }
 
-MARSHAL_BASE      = 2
-MARSHAL_LOG_SCALE = 3.0    # marshals = base + log_scale * ln(1 + count/50)
+# ── Module 5: Dynamic marshal multipliers by risk state ──────────────────────
+# D_mar^(k) = ⌈α_{l_k} · log₁₀(1 + N_k)⌉
+ALPHA_BY_STATUS = {
+    "SAFE":    0,
+    "WARNING": 4,
+    "DANGER":  10,
+}
 
 
+# ── ZoneState dataclass ───────────────────────────────────────────────────────
 @dataclass
 class ZoneState:
-    zone_id: str
-    label:   str
-    color:   str = "#6b7280"   # current border color
-    risk:    float = 0.0
-    density: float = 0.0       # D_norm
-    speed:   float = 0.0       # S_norm
+    zone_id:  str
+    label:    str
+    color:    str   = "#6b7280"
+    risk:     float = 0.0
+    density:  float = 0.0      # D_norm
+    speed:    float = 0.0      # S_norm
     conflict: float = 0.0      # C_norm
-    head_count: int = 0
-    corrected_count: int = 0
-    kappa:   float = 1.0
-    gate_cmd: str = "HOLD"
-    gate_color: str = "#22c55e"
-    status:  str = "SAFE"
-    fps:     float = 0.0
-    risk_history: list[float]   = field(default_factory=list)
-    density_history: list[float]= field(default_factory=list)
-    speed_history: list[float]  = field(default_factory=list)
-    conflict_history: list[float]=field(default_factory=list)
-    frame_rgb: Optional[np.ndarray] = None   # latest annotated frame
+
+    # Module 3: causal attribution
+    causal_ratios:  dict = field(default_factory=lambda: {"Density": 0.0, "Speed": 0.0, "Conflict": 0.0})
+    dominant_cause: str  = "Density"
+
+    head_count:      int   = 0
+    corrected_count: int   = 0
+    kappa:           float = 1.0
+    gate_cmd:        str   = "HOLD"
+    gate_color:      str   = "#22c55e"
+    status:          str   = "SAFE"
+    fps:             float = 0.0
+    peak_risk:       float = 0.0   # max CRS seen this session
+
+    risk_history:     list[float] = field(default_factory=list)
+    density_history:  list[float] = field(default_factory=list)
+    speed_history:    list[float] = field(default_factory=list)
+    conflict_history: list[float] = field(default_factory=list)
+    frame_rgb:        Optional[np.ndarray] = None
 
 
-def kappa(rho_norm: float) -> float:
-    """κ(ρ) = 1 + α₀·ρ^γ  — empirically calibrated occlusion correction."""
-    return 1.0 + KAPPA_ALPHA0 * (max(rho_norm, 0.0) ** KAPPA_GAMMA)
+# ── Module 2: κ(ρ) occlusion correction ──────────────────────────────────────
+def kappa(rho: float) -> float:
+    """κ(ρ) = 1 + α₀·ρ^γ  — empirically calibrated on 1,601 images (R²=0.615).
+    ρ = detected_heads / zone_capacity  (per-zone density ratio, NOT dataset max).
+    """
+    return 1.0 + KAPPA_ALPHA0 * (max(rho, 0.0) ** KAPPA_GAMMA)
 
 
+# ── Module 3: Non-linear risk score ──────────────────────────────────────────
 def compute_risk(D: float, S: float, C: float) -> float:
     """CA-CRS⁺ non-linear risk score.
-    CRS = w₁·D + w₂·S·(1−D) + γ_exp·exp(λ·(D−S)) + w₃·C
+    CRS = w₁·D + Φ(D,S) + w₃·C
+    Φ(D,S) = w₂·S·(1−D) + γ_exp·exp(λ·(D−S))
+    The exponential term captures the gridlock paradox: high D + low S = crush.
     """
-    phi = RISK_W2 * S * (1 - D) + RISK_GAMMA_EXP * np.exp(RISK_LAMBDA * (D - S))
-    crs = RISK_W1 * D + phi + RISK_W3 * C
-    return float(np.clip(crs, 0.0, 1.0))
+    phi = RISK_W2 * S * (1.0 - D) + RISK_GAMMA_EXP * np.exp(RISK_LAMBDA * (D - S))
+    return float(np.clip(RISK_W1 * D + phi + RISK_W3 * C, 0.0, 1.0))
 
 
+# ── Module 3: Causal attribution ─────────────────────────────────────────────
+def compute_causal_ratios(D: float, S: float, C: float) -> tuple[dict, str]:
+    """r_f^(k) = (w_f · X_f) / Σ_j(w_j · X_j)
+    Dominant cause = argmax(r_f) if r_f > CAUSAL_DOMINANCE_THRESHOLD.
+    Returns (ratio_dict, dominant_cause_name).
+    """
+    weighted = {
+        "Density":  RISK_W1 * D,
+        "Speed":    RISK_W2 * S,
+        "Conflict": RISK_W3 * C,
+    }
+    denom = sum(weighted.values()) + 1e-9
+    ratios = {k: round(v / denom, 4) for k, v in weighted.items()}
+    dominant = max(ratios, key=ratios.get)
+    # Must exceed dominance threshold; if no factor dominates → Density (default)
+    if ratios[dominant] < CAUSAL_DOMINANCE_THRESHOLD:
+        dominant = "Density"
+    return ratios, dominant
+
+
+# ── Status classifier ─────────────────────────────────────────────────────────
 def classify(risk: float) -> tuple[str, str]:
-    """Return (status, hex_color) for a risk value."""
     if risk >= THRESHOLD_DANGER:
         return "DANGER",  "#ef4444"
     if risk >= THRESHOLD_WARN:
@@ -98,67 +148,86 @@ def classify(risk: float) -> tuple[str, str]:
     return "SAFE", "#22c55e"
 
 
-def marshal_demand(total_heads: int) -> tuple[int, str]:
-    """Returns (n_marshals, status_label).
-    Formula: n = ⌈base + scale · ln(1 + N/50)⌉
+# ── Module 5: Per-zone logarithmic marshal demand ─────────────────────────────
+def marshal_demand(zone_states: list[ZoneState]) -> tuple[int, str]:
+    """D_mar = Σ_k ⌈α_{l_k} · log₁₀(1 + N_k)⌉
+    α is 0 / 4 / 10 for SAFE / WARNING / DANGER respectively.
+    Returns (total_marshals, overall_status_label).
     """
-    n = int(MARSHAL_BASE + MARSHAL_LOG_SCALE * np.log1p(total_heads / 50.0))
-    if total_heads < 100:
-        return n, "ADEQUATE"
-    if total_heads < 300:
-        return n, "STRAINED"
-    return n, "CRITICAL"
+    total = 0
+    for s in zone_states:
+        alpha = ALPHA_BY_STATUS[s.status]
+        n_k   = s.corrected_count
+        total += math.ceil(alpha * math.log10(1 + n_k)) if n_k > 0 else 0
+
+    # Overall label driven by worst zone
+    statuses = [s.status for s in zone_states]
+    if "DANGER" in statuses:
+        label = "CRITICAL"
+    elif "WARNING" in statuses:
+        label = "STRAINED"
+    else:
+        label = "ADEQUATE"
+    return total, label
 
 
+# ── Module 6: Urgency-weighted GRS ───────────────────────────────────────────
+def compute_grs(zone_states: list[ZoneState]) -> float:
+    """GRS = Σ(w_k · CRS_k) / Σ(w_k)
+    w_k = 2 for DANGER zones, 1 otherwise.
+    Ensures localized critical escalations are correctly reflected globally.
+    """
+    if not zone_states:
+        return 0.0
+    weights = [2.0 if z.status == "DANGER" else 1.0 for z in zone_states]
+    weighted_sum = sum(w * z.risk for w, z in zip(weights, zone_states))
+    return float(np.clip(weighted_sum / sum(weights), 0.0, 1.0))
+
+
+# ── ZoneProcessor ─────────────────────────────────────────────────────────────
 class ZoneProcessor:
-    """
-    Per-zone video processor with threaded frame reading.
-    Reads frames via ThreadedStream, runs head detection, computes risk.
-    Supports both file paths and RTSP URLs.
-    """
+    """Per-zone video processor: threaded frame read → YOLO → CA-CRS⁺ pipeline."""
 
     def __init__(
         self,
-        zone_id: str,
-        label: str,
+        zone_id:      str,
+        label:        str,
         video_source: str,
-        model,               # ultralytics YOLO model
-        conf: float = 0.25,
-        imgsz: int  = 640,
-        target_fps: int = 8,
+        model,
+        conf:         float = 0.25,
+        imgsz:        int   = 640,
+        target_fps:   int   = 8,
     ):
         self.zone_id = zone_id
         self.label   = label
         self.source  = video_source
 
-        # Threaded stream handles both files and RTSP
         self._stream = ThreadedStream(video_source, queue_size=2)
 
         self.model   = model
         self.conf    = conf
         self.imgsz   = imgsz
 
-        # Frame skipping for target FPS
         src_fps = self._stream.fps
-        self._frame_skip = max(1, int(src_fps / target_fps))
+        self._frame_skip  = max(1, int(src_fps / target_fps))
         self._frame_count = 0
 
         self._prev_positions: np.ndarray = np.zeros((0, 2))
         self._prev_time = time.time()
         self.state = ZoneState(zone_id=zone_id, label=label)
 
+    # ── Speed estimation ──────────────────────────────────────────────────────
     def _estimate_speed(self, curr_boxes: np.ndarray) -> float:
-        """Frame-to-frame centroid displacement → speed norm.
-        Normalized by V_MAX (15.0 px/frame from config).
+        """Frame-to-frame centroid displacement → S_norm.
+        Normalized by V_MAX (15.0 px/frame from config.yaml physics.v_max).
         """
         if len(curr_boxes) == 0:
             self._prev_positions = np.zeros((0, 2))
             return 0.0
-        # Compute centroids from boxes [x1,y1,x2,y2] → [cx,cy]
         curr_c = np.stack([
             (curr_boxes[:, 0] + curr_boxes[:, 2]) / 2,
             (curr_boxes[:, 1] + curr_boxes[:, 3]) / 2,
-        ], axis=1)   # shape (N, 2)
+        ], axis=1)
         if len(self._prev_positions) == 0:
             self._prev_positions = curr_c
             return 0.0
@@ -168,112 +237,141 @@ class ZoneProcessor:
         self._prev_positions = curr_c
         return float(np.clip(speed_px / V_MAX, 0.0, 1.0))
 
+    # ── Conflict estimation ───────────────────────────────────────────────────
     def _estimate_conflict(self, boxes: np.ndarray) -> float:
-        """Rough conflict: x-spread of centroids as proxy for bidirectional flow."""
+        """IQR-based conflict proxy for bidirectional / intersecting flow.
+        Uses inter-quartile range ratio — robust, doesn't self-cancel to zero.
+        """
         if len(boxes) < 4:
             return 0.0
         cx = boxes[:, 0] + (boxes[:, 2] - boxes[:, 0]) / 2
-        spread = float(cx.std() / (cx.max() - cx.min() + 1e-3))
-        return float(np.clip(spread * 1.5, 0.0, 1.0))
+        q75, q25 = np.percentile(cx, [75, 25])
+        span = cx.max() - cx.min() + 1e-3
+        iqr_ratio = (q75 - q25) / span
+        return float(np.clip(iqr_ratio * 2.0, 0.0, 1.0))
 
+    # ── Main frame processing ─────────────────────────────────────────────────
     def process_frame(self) -> ZoneState:
         t0 = time.time()
 
-        # Non-blocking read from threaded stream
         ok, frame = self._stream.read()
         if not ok or frame is None:
             return self.state
 
-        # Frame skipping for target FPS
         self._frame_count += 1
         if self._frame_count % self._frame_skip != 0:
             return self.state
 
-        # Run YOLO head detection (skip corrupt frames gracefully)
+        # ── YOLO inference ────────────────────────────────────────────────────
         try:
+            # Pre-resize to imgsz before model.predict() — reduces memory bandwidth
+            h0, w0 = frame.shape[:2]
+            scale   = self.imgsz / max(h0, w0)
+            frame_s = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
             results = self.model.predict(
-                frame, conf=self.conf, imgsz=self.imgsz, verbose=False
+                frame_s, conf=self.conf, imgsz=self.imgsz, verbose=False
             )[0]
-            boxes = results.boxes.xyxy.cpu().numpy() if results.boxes else np.zeros((0, 4))
+            # Scale boxes back to original resolution for annotation
+            if results.boxes and len(results.boxes):
+                boxes_s = results.boxes.xyxy.cpu().numpy()
+                boxes   = boxes_s / scale
+            else:
+                boxes = np.zeros((0, 4))
         except Exception:
             boxes = np.zeros((0, 4))
+
         head_count = len(boxes)
 
-        # Compute normalised inputs
-        rho      = head_count / KAPPA_MAX_GT
-        kap      = kappa(rho)
-        corrected_count = head_count * kap
-        D_norm   = float(np.clip(corrected_count / CAPACITY, 0.0, 1.0))
-        S_norm   = self._estimate_speed(boxes)
-        C_norm   = self._estimate_conflict(boxes)
+        # ── Module 2: κ(ρ) correction ────────────────────────────────────────
+        # ρ = per-zone density ratio = detected_heads / zone_capacity (350)
+        rho              = head_count / CAPACITY
+        kap              = kappa(rho)
+        corrected_count  = int(head_count * kap)
+
+        # ── Module 3: Normalized feature inputs ──────────────────────────────
+        D_norm = float(np.clip(corrected_count / CAPACITY, 0.0, 1.0))
+        S_norm = self._estimate_speed(boxes)
+        C_norm = self._estimate_conflict(boxes)
+
         risk_val = compute_risk(D_norm, S_norm, C_norm)
         status, color = classify(risk_val)
-        gate_cmd, gate_color = GATE_COMMANDS[status][0], GATE_COMMANDS[status][1]
 
-        # Annotate frame
-        frame_ann = self._annotate(frame.copy(), boxes, risk_val, status, color,
-                                   head_count, corrected_count)
+        # ── Module 3: Causal attribution r_f ─────────────────────────────────
+        causal_ratios, dominant_cause = compute_causal_ratios(D_norm, S_norm, C_norm)
+
+        # ── Module 4: Cause-to-gate mapping ──────────────────────────────────
+        if status == "SAFE":
+            gate_cmd, gate_color = "HOLD", "#22c55e"
+        else:
+            gate_cmd, gate_color = CAUSE_GATE_MAP[dominant_cause]
+
+        # ── Annotate frame ────────────────────────────────────────────────────
+        frame_ann = self._annotate(
+            frame.copy(), boxes, risk_val, status, color,
+            head_count, corrected_count, dominant_cause, causal_ratios
+        )
         frame_rgb = cv2.cvtColor(frame_ann, cv2.COLOR_BGR2RGB)
 
         elapsed = time.time() - t0
-        fps = 1.0 / max(elapsed, 0.001)
+        fps     = 1.0 / max(elapsed, 0.001)
 
-        # Update state
+        # ── Update state ──────────────────────────────────────────────────────
         s = self.state
-        s.risk     = round(risk_val, 4)
-        s.density  = round(D_norm, 4)
-        s.speed    = round(S_norm, 4)
-        s.conflict = round(C_norm, 4)
-        s.head_count = head_count
-        s.corrected_count = int(corrected_count)
-        s.kappa    = round(kap, 3)
-        s.status   = status
-        s.color    = color
-        s.gate_cmd = gate_cmd
-        s.gate_color = gate_color
-        s.fps      = round(fps, 1)
-        s.frame_rgb = frame_rgb
+        s.risk            = round(risk_val, 4)
+        s.density         = round(D_norm, 4)
+        s.speed           = round(S_norm, 4)
+        s.conflict        = round(C_norm, 4)
+        s.causal_ratios   = causal_ratios
+        s.dominant_cause  = dominant_cause
+        s.head_count      = head_count
+        s.corrected_count = corrected_count
+        s.kappa           = round(kap, 3)
+        s.status          = status
+        s.color           = color
+        s.gate_cmd        = gate_cmd
+        s.gate_color      = gate_color
+        s.fps             = round(fps, 1)
+        s.frame_rgb       = frame_rgb
+        s.peak_risk       = max(s.peak_risk, risk_val)  # session peak
 
         MAXHIST = 150
-        s.risk_history    = (s.risk_history    + [risk_val])[-MAXHIST:]
-        s.density_history = (s.density_history + [D_norm  ])[-MAXHIST:]
-        s.speed_history   = (s.speed_history   + [S_norm  ])[-MAXHIST:]
-        s.conflict_history= (s.conflict_history+ [C_norm  ])[-MAXHIST:]
+        s.risk_history     = (s.risk_history     + [risk_val])[-MAXHIST:]
+        s.density_history  = (s.density_history  + [D_norm  ])[-MAXHIST:]
+        s.speed_history    = (s.speed_history    + [S_norm  ])[-MAXHIST:]
+        s.conflict_history = (s.conflict_history + [C_norm  ])[-MAXHIST:]
 
         return s
 
-    def _annotate(self, frame, boxes, risk, status, color, raw_count, corr_count):
+    # ── Frame annotation ──────────────────────────────────────────────────────
+    def _annotate(
+        self, frame, boxes, risk, status, color,
+        raw_count, corr_count, dominant_cause, causal_ratios
+    ):
         h, w = frame.shape[:2]
-        # Draw coloured border
-        c = {"SAFE": (34,197,94), "WARNING": (245,158,11), "DANGER": (239,68,68)}[status]
-        thick = 10
-        cv2.rectangle(frame, (0, 0), (w, h), c, thick * 2)
+        c = {"SAFE": (34, 197, 94), "WARNING": (245, 158, 11), "DANGER": (239, 68, 68)}[status]
 
-        # Draw bounding boxes
+        # Coloured border
+        cv2.rectangle(frame, (0, 0), (w, h), c, 14)
+
+        # Bounding boxes
         for box in boxes:
             x1, y1, x2, y2 = map(int, box[:4])
             cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
 
         # HUD overlay
         overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 90), (0, 0, 0), -1)
-        frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+        cv2.rectangle(overlay, (0, 0), (w, 100), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
         font = cv2.FONT_HERSHEY_DUPLEX
-        cv2.putText(frame, f"Heads: {raw_count}  Corrected: {corr_count:.0f}",
-                    (12, 30), font, 0.7, (255,255,255), 1)
+        dom_pct = causal_ratios.get(dominant_cause, 0.0) * 100
+        cv2.putText(frame, f"Heads: {raw_count}  Corr: {corr_count}",
+                    (12, 28), font, 0.65, (255, 255, 255), 1)
         cv2.putText(frame, f"CRS: {risk:.3f}  [{status}]",
-                    (12, 62), font, 0.85, c, 2)
+                    (12, 58), font, 0.85, c, 2)
+        cv2.putText(frame, f"Cause: {dominant_cause} ({dom_pct:.0f}%)",
+                    (12, 88), font, 0.55, (180, 180, 180), 1)
         return frame
 
     def stop(self):
-        """Cleanly stop the threaded stream."""
         self._stream.stop()
-
-
-def compute_grs(zone_states: list[ZoneState]) -> float:
-    """Global Risk Score = weighted max + mean blend."""
-    if not zone_states:
-        return 0.0
-    risks = [z.risk for z in zone_states]
-    return float(np.clip(0.6 * max(risks) + 0.4 * np.mean(risks), 0.0, 1.0))

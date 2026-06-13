@@ -34,7 +34,15 @@ from dashboard.virtual_plc import (
     read_all_gates, is_plc_running,
 )
 
+import math
+
 logging.basicConfig(level=logging.WARNING)
+
+
+@st.cache_resource
+def _get_executor() -> ThreadPoolExecutor:
+    """Cached executor — created once, truly reused across all Streamlit reruns."""
+    return ThreadPoolExecutor(max_workers=3)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -411,32 +419,61 @@ def make_risk_chart(states: list[ZoneState]) -> go.Figure:
 
 
 def make_causal_chart(states: list[ZoneState]) -> go.Figure:
-    labels = [s.label for s in states]
-    density  = [s.density  for s in states]
-    speed    = [s.speed    for s in states]
-    conflict = [s.conflict for s in states]
+    """Causal Factor Breakdown using weighted attribution ratios r_f.
+    r_f^(k) = (w_f · X_f) / Σ_j(w_j · X_j)  — Module 3 paper formula.
+    Bars show proportion of risk attributable to each causal factor.
+    """
+    labels   = [s.label for s in states]
+    density  = [s.causal_ratios.get("Density",  0.0) for s in states]
+    speed    = [s.causal_ratios.get("Speed",    0.0) for s in states]
+    conflict = [s.causal_ratios.get("Conflict", 0.0) for s in states]
+
+    # Build dominant-cause annotation labels
+    dom_labels = [f"★ {s.dominant_cause}" for s in states]
 
     fig = go.Figure()
-    fig.add_bar(name="How tightly packed",  x=labels, y=density,
-                marker_color="#6366f1", text=[f"{v:.2f}" for v in density],
-                textposition="inside", textfont=dict(size=10))
-    fig.add_bar(name="How fast people move",    x=labels, y=speed,
-                marker_color="#06b6d4", text=[f"{v:.2f}" for v in speed],
-                textposition="inside", textfont=dict(size=10))
-    fig.add_bar(name="People crossing paths", x=labels, y=conflict,
-                marker_color="#f59e0b", text=[f"{v:.2f}" for v in conflict],
-                textposition="inside", textfont=dict(size=10))
+    fig.add_bar(
+        name="Density (r_D)", x=labels, y=density,
+        marker_color="#6366f1",
+        text=[f"{v*100:.0f}%" for v in density],
+        textposition="inside", textfont=dict(size=10),
+    )
+    fig.add_bar(
+        name="Speed (r_S)", x=labels, y=speed,
+        marker_color="#06b6d4",
+        text=[f"{v*100:.0f}%" for v in speed],
+        textposition="inside", textfont=dict(size=10),
+    )
+    fig.add_bar(
+        name="Conflict (r_C)", x=labels, y=conflict,
+        marker_color="#f59e0b",
+        text=[f"{v*100:.0f}%" for v in conflict],
+        textposition="inside", textfont=dict(size=10),
+    )
+
+    # Dominant cause threshold line
+    fig.add_hline(
+        y=0.40, line=dict(color="#94a3b8", dash="dot", width=1),
+        annotation_text="Dominance threshold (0.40)",
+        annotation_position="top right",
+        annotation_font=dict(color="#94a3b8", size=9),
+    )
 
     fig.update_layout(
-        barmode="stack", height=200,
-        margin=dict(l=10, r=10, t=10, b=30),
+        barmode="stack", height=220,
+        margin=dict(l=10, r=10, t=30, b=30),
         paper_bgcolor="#0a0e1a", plot_bgcolor="#0f1628",
         xaxis=dict(color="#334155"),
-        yaxis=dict(range=[0, 1.05], gridcolor="#1e2d4a", color="#334155"),
+        yaxis=dict(range=[0, 1.05], gridcolor="#1e2d4a", color="#334155",
+                   title="Attribution Ratio r_f"),
         legend=dict(bgcolor="#0f1628", bordercolor="#1e2d4a",
                     font=dict(size=11, color="#94a3b8"),
-                    orientation="h", y=1.1),
+                    orientation="h", y=1.12),
         font=dict(family="Inter", color="#e2e8f0"),
+        title=dict(
+            text=" | ".join(dom_labels),
+            font=dict(size=11, color="#94a3b8"), x=0.5,
+        ),
     )
     return fig
 
@@ -444,18 +481,29 @@ def make_causal_chart(states: list[ZoneState]) -> go.Figure:
 # ── Render: zone info card (below video) ──────────────────────────────────────
 def zone_info_html(s: ZoneState) -> str:
     border = s.color
+    dom_pct = s.causal_ratios.get(s.dominant_cause, 0.0) * 100
+    peak_color = "#ef4444" if s.peak_risk >= 0.70 else "#f59e0b" if s.peak_risk >= 0.35 else "#22c55e"
     return f"""
     <div style='display:flex;justify-content:space-between;
                 align-items:center;padding:6px 2px'>
         <span style='font-weight:700;font-size:14px;color:#e2e8f0'>
             {s.label}
         </span>
-        <span style='background:{border}22;color:{border};
-                     padding:2px 10px;border-radius:12px;
-                     font-size:11px;font-weight:700;
-                     border:1px solid {border}55'>
-            {friendly_status(s.status)}
-        </span>
+        <div style='display:flex;gap:6px;align-items:center'>
+            <span style='background:{border}22;color:{border};
+                         padding:2px 10px;border-radius:12px;
+                         font-size:11px;font-weight:700;
+                         border:1px solid {border}55'>
+                {friendly_status(s.status)}
+            </span>
+            <span style='background:#1e2d4a;color:{peak_color};
+                         padding:2px 8px;border-radius:10px;
+                         font-size:10px;font-family:JetBrains Mono,monospace;
+                         border:1px solid {peak_color}44'
+                  title='Session peak CRS score'>
+                ▲{s.peak_risk:.3f}
+            </span>
+        </div>
     </div>
     <div style='display:flex;gap:8px;margin:4px 0'>
         <div style='flex:1;background:#0f1628;border-radius:8px;
@@ -476,12 +524,22 @@ def zone_info_html(s: ZoneState) -> str:
         </div>
         <div style='flex:1;background:#0f1628;border-radius:8px;
                     padding:8px 10px;border:1px solid #1e2d4a'>
-            <div style='font-size:10px;color:#64748b'>κ (ρ-corr)</div>
+            <div style='font-size:10px;color:#64748b'>κ(ρ)</div>
             <div style='font-size:20px;font-weight:800;
                         font-family:JetBrains Mono;color:#94a3b8'>
                 {s.kappa:.2f}
             </div>
         </div>
+    </div>
+    <div style='background:#0f1628;border-radius:6px;padding:6px 10px;
+                border:1px solid #1e2d4a;margin-top:4px;
+                font-size:11px;color:#94a3b8;display:flex;gap:6px;
+                align-items:center'>
+        <span style='color:#64748b'>Dominant Cause:</span>
+        <span style='color:{border};font-weight:700'>{s.dominant_cause}</span>
+        <span style='color:#475569'>({dom_pct:.0f}%)</span>
+        <span style='margin-left:auto;color:#64748b'>→ Gate:</span>
+        <span style='color:#e2e8f0;font-family:JetBrains Mono;font-weight:700'>{s.gate_cmd}</span>
     </div>
     """
 
@@ -611,8 +669,8 @@ def run_dashboard(processors: list[ZoneProcessor]):
     telem_cols = st.columns(6)
     ph_telemetry = [col.empty() for col in telem_cols]
 
-    # Initialize ThreadPoolExecutor for parallel YOLO inference
-    executor = ThreadPoolExecutor(max_workers=3)
+    # Persistent ThreadPoolExecutor — cached so it's truly reused across ticks
+    executor = _get_executor()
 
     # ═══════════════════════════════════════════════════════════════════════════
     #  LIVE UPDATE LOOP — only placeholders are updated, no DOM rebuild
@@ -623,10 +681,12 @@ def run_dashboard(processors: list[ZoneProcessor]):
         futures = [executor.submit(p.process_frame) for p in processors]
         states: list[ZoneState] = [f.result() for f in futures]
         
+        # Module 6: Urgency-weighted GRS
         grs = compute_grs(states)
         grs_status, grs_color = classify(grs)
-        total_heads = sum(s.head_count for s in states)
-        n_marshals, marshal_status = marshal_demand(total_heads)
+        total_heads = sum(s.corrected_count for s in states)
+        # Module 5: Per-zone log10 marshal demand
+        n_marshals, marshal_status = marshal_demand(states)
         st.session_state.tick += 1
 
         # ── Auto gate control + ripple logic ─────────────────────────────────
@@ -636,19 +696,22 @@ def run_dashboard(processors: list[ZoneProcessor]):
 
         if st.session_state.auto_gate and not st.session_state.emergency_active:
             for i, s in enumerate(states):
-                # Ripple: if REDIRECT but downstream zone is DANGER → HOLD
-                if s.status == "WARNING":
+                # Module 4: Ripple-effect prevention
+                # If gate_cmd is REDIRECT, check downstream zone risk > 0.50
+                # (not just DANGER threshold of 0.70 — paper spec: strictly > 0.50)
+                if gate_cmds_final[i] == "REDIRECT":
                     downstream_idx = (i + 1) % len(states)
-                    if states[downstream_idx].status == "DANGER":
+                    if states[downstream_idx].risk > 0.50:
                         gate_cmds_final[i] = "HOLD"
-                        ripple_notes[i] = "⚠ Ripple: downstream congested → HOLD"
+                        ripple_notes[i] = f"⚠ Ripple: downstream risk {states[downstream_idx].risk:.2f} > 0.50 → HOLD"
 
                 new_open = (gate_cmds_final[i] == "OPEN")
                 if new_open != st.session_state.gate_states.get(i, False):
                     ok = write_gate(i, new_open)
                     if ok:
                         action = "OPENED" if new_open else "CLOSED"
-                        log_entry = f"[{time.strftime('%H:%M:%S')}] {s.label} gate {action}"
+                        cause_note = f" [{s.dominant_cause}-driven]"
+                        log_entry = f"[{time.strftime('%H:%M:%S')}] {s.label} gate {action}{cause_note}"
                         st.session_state.gate_log = (
                             [log_entry] + st.session_state.gate_log
                         )[:20]
@@ -663,15 +726,28 @@ def run_dashboard(processors: list[ZoneProcessor]):
         🔄 Live &nbsp;·&nbsp; {time.strftime("%H:%M:%S")}
         </span></div>""", unsafe_allow_html=True)
 
-        # Danger Banner
+        # Danger Banner — shows dominant cause and gate action (Module 3/4)
         danger_zones = [s for s in states if s.status == "DANGER"]
         if danger_zones:
-            labels_str = ", ".join([s.label for s in danger_zones])
-            alert_msg = f"🚨 &nbsp;<strong>TOO CROWDED:</strong> {labels_str} is dangerously packed. Nearby gates were closed automatically so more people don't pile in."
+            parts = []
+            for dz in danger_zones:
+                gate_action_map = {
+                    "OPEN": "exit gates OPENED (density relief)",
+                    "CLOSE": "entry gates CLOSED (inflow stop)",
+                    "REDIRECT": "crowd REDIRECTED (flow separation)",
+                    "HOLD": "gates HELD (ripple prevention)",
+                }
+                action_text = gate_action_map.get(dz.gate_cmd, dz.gate_cmd)
+                dom_pct = dz.causal_ratios.get(dz.dominant_cause, 0.0) * 100
+                parts.append(
+                    f"<strong>{dz.label}</strong> — Cause: {dz.dominant_cause} "
+                    f"({dom_pct:.0f}%) → {action_text}"
+                )
+            alert_msg = "🚨 &nbsp;DANGER: " + " &nbsp;|&nbsp; ".join(parts)
             ph_danger_banner.markdown(f"""
             <div class="danger-banner" style="
                 color: #ffffff; padding: 14px 20px; border-radius: 10px;
-                font-weight: 700; font-size: 14px; text-align: center;
+                font-weight: 700; font-size: 13px; text-align: center;
                 margin-bottom: 16px; border: 1px solid rgba(255,255,255,0.15);
             ">
                 {alert_msg}
@@ -717,19 +793,36 @@ def run_dashboard(processors: list[ZoneProcessor]):
             """
         ph_triage.markdown(triage_html, unsafe_allow_html=True)
 
-        # Resource Demand
-        m_color = "#ef4444" if n_marshals > 6 else "#f59e0b" if n_marshals > 2 else "#22c55e"
+        # Resource Demand — per-zone breakdown (Module 5)
+        import math as _math
+        ALPHA_MAP = {"SAFE": 0, "WARNING": 4, "DANGER": 10}
+        m_color = "#ef4444" if marshal_status == "CRITICAL" else "#f59e0b" if marshal_status == "STRAINED" else "#22c55e"
+        per_zone_rows = ""
+        for s in states:
+            alpha = ALPHA_MAP[s.status]
+            per_demand = _math.ceil(alpha * _math.log10(1 + s.corrected_count)) if s.corrected_count > 0 else 0
+            row_color = "#ef4444" if s.status == "DANGER" else "#f59e0b" if s.status == "WARNING" else "#22c55e"
+            per_zone_rows += f"""
+            <div style='display:flex;justify-content:space-between;align-items:center;
+                        padding:4px 8px;border-bottom:1px solid #1e2d4a;font-size:11px'>
+                <span style='color:#94a3b8'>{s.label}</span>
+                <span style='color:#64748b'>α={alpha}·log₁₀(1+{s.corrected_count})</span>
+                <span style='color:{row_color};font-family:JetBrains Mono;font-weight:700'>{per_demand}</span>
+            </div>"""
         ph_marshal.markdown(f"""
-        <div class='metric-card' style='text-align:center;padding:24px 20px'>
-            <div style='font-size:11px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase'>
-                Active Marshals Required
+        <div class='metric-card' style='padding:16px 20px'>
+            <div style='text-align:center'>
+                <div style='font-size:10px;color:#94a3b8;letter-spacing:1px;text-transform:uppercase'>
+                    Active Marshals Required
+                </div>
+                <div style='font-size:42px;font-weight:800;font-family:JetBrains Mono;color:{m_color};margin:4px 0'>
+                    {n_marshals}
+                </div>
+                <div style='font-size:11px;color:{m_color};font-weight:600;margin-bottom:10px'>
+                    {marshal_status} · D_mar = Σ⌈α_l·log₁₀(1+N_k)⌉
+                </div>
             </div>
-            <div style='font-size:48px;font-weight:800;font-family:JetBrains Mono;color:{m_color};margin:4px 0'>
-                {n_marshals}
-            </div>
-            <div style='font-size:12px;color:{m_color};font-weight:600'>
-                {marshal_status}
-            </div>
+            {per_zone_rows}
         </div>
         """, unsafe_allow_html=True)
 
