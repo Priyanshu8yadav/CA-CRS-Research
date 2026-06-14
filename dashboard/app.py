@@ -663,13 +663,10 @@ def run_dashboard(processors: list[ZoneProcessor]):
     executor = _get_executor()
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LIVE UPDATE LOOP — True flicker-free updates using Streamlit Fragments
+    #  LIVE UPDATE LOOP — only placeholders are updated, no DOM rebuild
     # ═══════════════════════════════════════════════════════════════════════════
-    @st.fragment(run_every="0.03s")
-    def live_update_loop():
-        if st.session_state.processors is None:
-            return
-            
+    while st.session_state.processors is not None:
+        
         # Parallel frame processing across all cameras using ThreadPoolExecutor
         futures = [executor.submit(p.process_frame) for p in processors]
         states: list[ZoneState] = [f.result() for f in futures]
@@ -759,12 +756,13 @@ def run_dashboard(processors: list[ZoneProcessor]):
                 ph_videos[i].image(thumb, width="stretch")
             ph_zone_info[i].markdown(zone_info_html(s), unsafe_allow_html=True)
 
-        # GRS gauge — stable key prevents WebGL canvas destroy/recreate (no flicker)
+        # GRS gauge — direct placeholder call (no container wrapper = no flicker)
+        tick = st.session_state.tick
         ph_gauge.plotly_chart(
             make_gauge(grs, "GRS", grs_color),
             use_container_width=True,
             config={"displayModeBar": False},
-            key="grs_gauge",
+            key=f"grs_gauge_{tick}",
         )
 
         # Zone triage — compact HTML, no leading whitespace (avoids markdown code-block bug)
@@ -807,18 +805,18 @@ def run_dashboard(processors: list[ZoneProcessor]):
                         f"</div>")
         ph_marshal.markdown(marshal_html, unsafe_allow_html=True)
 
-        # Charts — stable keys + direct placeholder call = zero-flicker in-place update
+        # Charts — direct placeholder call (no container wrapper = no flicker)
         ph_timeline.plotly_chart(
             make_risk_chart(states),
             use_container_width=True,
             config={"displayModeBar": False},
-            key="risk_timeline",
+            key=f"risk_timeline_{tick}",
         )
         ph_causal.plotly_chart(
             make_causal_chart(states),
             use_container_width=True,
             config={"displayModeBar": False},
-            key="causal_chart",
+            key=f"causal_chart_{tick}",
         )
 
         # Gate status panel — compact single-line HTML, no leading spaces
@@ -865,6 +863,7 @@ def run_dashboard(processors: list[ZoneProcessor]):
         ]
 
         for ph, label, val, color in telems:
+            # Compact single-line — no leading spaces (avoid markdown code-block)
             ph.markdown(
                 f"<div class='info-card' style='padding:12px;text-align:center'>"
                 f"<div style='font-size:10px;color:#64748b;letter-spacing:1px;text-transform:uppercase'>{label}</div>"
@@ -872,9 +871,6 @@ def run_dashboard(processors: list[ZoneProcessor]):
                 f"</div>",
                 unsafe_allow_html=True,
             )
-
-    # Start the fragment loop
-    live_update_loop()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
