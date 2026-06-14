@@ -239,17 +239,22 @@ def init_session():
 init_session()
 
 
-# Resolve default paths dynamically based on active user's Home / Downloads directory
-downloads_dir = Path.home() / "Downloads"
-def get_default_path(filename: str, fallback: str) -> str:
-    local_file = downloads_dir / filename
-    if local_file.exists():
-        return str(local_file)
-    return fallback
+# Resolve default video paths: check public/ folder first, then ~/Downloads/
+def get_default_path(filename: str) -> str:
+    # 1. public/ folder in repo root (recommended — README tells judges to put files here)
+    public_file = ROOT / "public" / filename
+    if public_file.exists():
+        return str(public_file)
+    # 2. ~/Downloads/ (common developer fallback)
+    downloads_file = Path.home() / "Downloads" / filename
+    if downloads_file.exists():
+        return str(downloads_file)
+    # 3. Return the public/ path as placeholder — user updates in sidebar
+    return str(ROOT / "public" / filename)
 
-VIDEO_A = get_default_path("scen_a.mp4", "C:/Users/pp/Downloads/scen_a.mp4")
-VIDEO_B = get_default_path("scen_b.mp4", "C:/Users/pp/Downloads/scen_b.mp4")
-VIDEO_C = get_default_path("scen_c.mp4", "C:/Users/pp/Downloads/scen_c.mp4")
+VIDEO_A = get_default_path("scen_a.mp4")
+VIDEO_B = get_default_path("scen_b.mp4")
+VIDEO_C = get_default_path("scen_c.mp4")
 
 ZONE_LABELS = {
     "zone_a": "Entry Corridor",
@@ -732,15 +737,14 @@ def run_dashboard(processors: list[ZoneProcessor]):
                     f"<strong>{dz.label}</strong> — Cause: {cause_text} → {action_text}"
                 )
             alert_msg = "🚨 &nbsp;DANGER: " + " &nbsp;|&nbsp; ".join(parts)
-            ph_danger_banner.markdown(f"""
-            <div class="danger-banner" style="
-                color: #ffffff; padding: 14px 20px; border-radius: 10px;
-                font-weight: 700; font-size: 13px; text-align: center;
-                margin-bottom: 16px; border: 1px solid rgba(255,255,255,0.15);
-            ">
-                {alert_msg}
-            </div>
-            """, unsafe_allow_html=True)
+            ph_danger_banner.markdown(
+                f"<div class='danger-banner' style='"
+                f"color:#ffffff;padding:14px 20px;border-radius:10px;"
+                f"font-weight:700;font-size:13px;text-align:center;"
+                f"margin-bottom:16px;border:1px solid rgba(255,255,255,0.15);'>"
+                f"{alert_msg}</div>",
+                unsafe_allow_html=True,
+            )
         else:
             ph_danger_banner.empty()
 
@@ -752,12 +756,13 @@ def run_dashboard(processors: list[ZoneProcessor]):
                 ph_videos[i].image(thumb, width="stretch")
             ph_zone_info[i].markdown(zone_info_html(s), unsafe_allow_html=True)
 
-        # GRS gauge
-        tick = st.session_state.tick
-        with ph_gauge.container():
-            st.plotly_chart(make_gauge(grs, "GRS", grs_color),
-                            width="stretch", config={"displayModeBar": False},
-                            key=f"grs_gauge_{tick}")
+        # GRS gauge — stable key prevents WebGL canvas destroy/recreate (no flicker)
+        ph_gauge.plotly_chart(
+            make_gauge(grs, "GRS", grs_color),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="grs_gauge",
+        )
 
         # Zone triage — compact HTML, no leading whitespace (avoids markdown code-block bug)
         triage_html = ""
@@ -799,13 +804,19 @@ def run_dashboard(processors: list[ZoneProcessor]):
                         f"</div>")
         ph_marshal.markdown(marshal_html, unsafe_allow_html=True)
 
-        # Charts
-        with ph_timeline.container():
-            st.plotly_chart(make_risk_chart(states), width="stretch",
-                            config={"displayModeBar": False}, key=f"timeline_{tick}")
-        with ph_causal.container():
-            st.plotly_chart(make_causal_chart(states), width="stretch",
-                            config={"displayModeBar": False}, key=f"causal_{tick}")
+        # Charts — stable keys + direct placeholder call = zero-flicker in-place update
+        ph_timeline.plotly_chart(
+            make_risk_chart(states),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="risk_timeline",
+        )
+        ph_causal.plotly_chart(
+            make_causal_chart(states),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="causal_chart",
+        )
 
         # Gate status panel — compact single-line HTML, no leading spaces
         gate_html = ""
@@ -851,11 +862,14 @@ def run_dashboard(processors: list[ZoneProcessor]):
         ]
 
         for ph, label, val, color in telems:
-            ph.markdown(f"""
-            <div class='info-card' style='padding:12px;text-align:center'>
-                <div style='font-size:10px;color:#64748b;letter-spacing:1px;text-transform:uppercase'>{label}</div>
-                <div style='font-size:22px;font-weight:800;font-family:JetBrains Mono;color:{color};margin-top:4px'>{val}</div>
-            </div>""", unsafe_allow_html=True)
+            # Compact single-line — no leading spaces (avoid markdown code-block)
+            ph.markdown(
+                f"<div class='info-card' style='padding:12px;text-align:center'>"
+                f"<div style='font-size:10px;color:#64748b;letter-spacing:1px;text-transform:uppercase'>{label}</div>"
+                f"<div style='font-size:22px;font-weight:800;font-family:JetBrains Mono;color:{color};margin-top:4px'>{val}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

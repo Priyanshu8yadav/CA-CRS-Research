@@ -21,11 +21,15 @@ models/*.engine
 outputs/calibration/yolo_calibration_dataset.csv
 outputs/
 
-# Video files
+# Video files — ignored globally, but public/ folder is excluded from this rule
 *.mp4
 *.avi
 *.mov
 *.mkv
+!public/*.mp4
+!public/*.avi
+!public/*.mov
+!public/*.mkv
 
 # Jupyter
 .ipynb_checkpoints/
