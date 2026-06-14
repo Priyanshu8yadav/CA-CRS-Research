@@ -26,6 +26,8 @@ Three crowd scenario videos are required to run the dashboard:
 | `scen_b.mp4` | Central Plaza | Central mass gathering |
 | `scen_c.mp4` | Exit Corridor | Exit flow scenario |
 
+- **Video Datasets:** [Download the test video scenarios here (Google Drive)](https://drive.google.com/drive/u/1/folders/1JIDaOIGIhMhedQfAmlVUW6j5cHAvHEV-?usp=share_link)
+
 Place them in the `public/` folder of this repository, or anywhere on your system and update the paths in the sidebar.
 
 ---
