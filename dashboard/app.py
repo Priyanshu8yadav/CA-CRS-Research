@@ -14,6 +14,51 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
+# Global dictionary to hold the latest JPEG bytes for each camera
+latest_frames = {"zone_a": None, "zone_b": None, "zone_c": None}
+
+class MJPEGHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass # Suppress logging
+
+    def do_GET(self):
+        # Route the request to the correct camera zone (e.g., /zone_a.mjpg)
+        zone = self.path.strip('/').split('.')[0]
+        if zone in latest_frames:
+            self.send_response(200)
+            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=--jpgboundary')
+            self.end_headers()
+            while True:
+                try:
+                    frame = latest_frames.get(zone)
+                    if frame is not None:
+                        self.wfile.write(b"--jpgboundary\r\n")
+                        self.send_header('Content-type', 'image/jpeg')
+                        self.send_header('Content-length', str(len(frame)))
+                        self.end_headers()
+                        self.wfile.write(frame)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(0.05) # Limit to ~20 FPS to save CPU bandwidth
+                except Exception:
+                    break # Client disconnected
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
+    pass
+
+def start_mjpeg_server(port=8080):
+    server = ThreadedHTTPServer(('0.0.0.0', port), MJPEGHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
+
 import numpy as np
 import plotly.graph_objects as go
 import psutil
@@ -752,8 +797,18 @@ def run_dashboard(processors: list[ZoneProcessor]):
         for i, s in enumerate(states):
             border = s.color
             if s.frame_rgb is not None:
-                thumb = cv2.resize(s.frame_rgb, (400, 225))
-                ph_videos[i].image(thumb, width="stretch")
+                # Resize for performance and encode to JPEG format
+                thumb = cv2.resize(s.frame_rgb, (640, 360))
+                _, buffer = cv2.imencode('.jpg', cv2.cvtColor(thumb, cv2.COLOR_RGB2BGR))
+                
+                # Push to the background server dictionary
+                latest_frames[s.zone_id] = buffer.tobytes()
+
+                # Zero-flicker HTML embed (renders via MJPEG server)
+                ph_videos[i].markdown(
+                    f'<img src="http://localhost:8080/{s.zone_id}.mjpg" style="width:100%; border-radius:10px; border: 2px solid {border};">', 
+                    unsafe_allow_html=True
+                )
             ph_zone_info[i].markdown(zone_info_html(s), unsafe_allow_html=True)
 
         # GRS gauge — direct placeholder call (no container wrapper = no flicker)
@@ -875,6 +930,10 @@ def run_dashboard(processors: list[ZoneProcessor]):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
+    # Ensure the server starts only once
+    if "mjpeg_server" not in st.session_state:
+        st.session_state.mjpeg_server = start_mjpeg_server(port=8080)
+
     if not st.session_state.plc_started:
         start_plc_server()
         st.session_state.plc_started = True
